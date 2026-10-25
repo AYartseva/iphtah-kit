@@ -1,0 +1,10 @@
+{
+  "_about": "Your definition of done: the checks a push needs, each with its why. Yours to change with your Claude: add a check (name, why, run, optionally repos), or take one out. The green merge-check is asked for until this file moves it to a « removed » list with a line saying why, your decision in a sentence of your own (three words or more; this example's text, as it stands, is refused): \"removed\": [{\"name\": \"merge-check\", \"why\": \"your reason, in a sentence of your own\"}]. Each push it lets through then shows that why. done-check runs the other checks on the commit to push and records the green ones. A kit update keeps this file as it is; the kit's own default is done.default.json beside it.",
+  "checks": [
+    {
+      "name": "merge-check",
+      "why": "The branch merged with its base builds and passes the whole suite, for the exact commit pushed: what CI will build, before anyone else waits on it.",
+      "run": "merge-check <repo> <branch> --local"
+    }
+  ]
+}

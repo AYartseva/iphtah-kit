@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""when-quiet [--urgent] [--load N] [--checks K] [--every S] [--max-hours H] -- <command…>
+"""
+import json, os, subprocess, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _machine
+
+
+def _log(*args, **kw):
+    ""
+    try:
+        import _safelog
+        _safelog.log(*args, **kw)
+    except BaseException:
+        pass
+
+QUEUE = os.path.expanduser(os.environ.get("IPHTAH_WHEN_QUIET_DIR", "~/.local/state/iphtah-kit/when-quiet"))
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, ValueError):
+        return False
+
+
+def urgent_waiting(me):
+    ""
+    try:
+        names = os.listdir(QUEUE)
+    except FileNotFoundError:
+        return False
+    for n in names:
+        try:
+            w = json.load(open(os.path.join(QUEUE, n)))
+        except (OSError, ValueError):
+            continue
+        if w.get("urgent") and w.get("pid") != me and _alive(int(w.get("pid", 0))):
+            return True
+    return False
+
+
+def load1():
+    v = os.environ.get("IPHTAH_LOAD")
+    return float(v) if v else os.getloadavg()[0]
+
+
+def decided(kind, started, held_load, limit, yielded, urgent, contended):
+    ""
+    try:
+        if contended:
+            waited = int(time.time() - started)
+            busy = "urgent_waiter" if yielded else f"load:{held_load:.1f}of{limit:g}" if held_load is not None else "load:unknown"
+            _log("when-quiet", kind, ["run_now", busy], "urgent_waiter" if yielded else "load",
+                 "quiet_load_urgent" if urgent else "quiet_load", wait_s=waited)
+    except Exception:
+        pass
+
+
+def main(argv):
+    if "--" not in argv:
+        sys.exit(__doc__)
+    load, checks, every, max_h = None, 2, 60, 12.0
+    i = argv.index("--")
+    opts, cmd = argv[:i], argv[i + 1:]
+    urgent = "--urgent" in opts
+    if not cmd:
+        sys.exit("when-quiet: no command after --")
+    for name, conv in (("--load", float), ("--checks", int), ("--every", int), ("--max-hours", float)):
+        if name in opts:
+            v = conv(opts[opts.index(name) + 1])
+            if name == "--load": load = v
+            elif name == "--checks": checks = v
+            elif name == "--every": every = v
+            else: max_h = v
+    if load is None:
+        load = float(_machine.limit("quiet_load"))
+    if urgent:
+        checks = 1
+        load = load * 2
+    os.makedirs(QUEUE, exist_ok=True)
+    me = os.getpid()
+    mine = os.path.join(QUEUE, f"{me}.json")
+    json.dump({"pid": me, "urgent": urgent, "since": time.time(), "cmd": " ".join(cmd)[:200]}, open(mine, "w"))
+    started = time.time()
+    deadline = started + max_h * 3600
+    calm, held_load, yielded, contended = 0, None, False, False
+    try:
+        while True:
+            l1 = load1()
+            if held_load is None and l1 >= load:
+                held_load = l1
+            yielding = (not urgent) and urgent_waiting(me)
+            yielded = yielded or yielding
+            calm = calm + 1 if (l1 < load and not yielding) else 0
+            contended = contended or calm == 0
+            if calm >= checks:
+                break
+            if time.time() > deadline:
+                decided("gave_up", started, held_load, load, yielded, urgent, True)
+                sys.exit(f"when-quiet: still busy after {max_h} h (load {l1:.1f}); gave up")
+            time.sleep(every)
+    finally:
+        try:
+            os.remove(mine)
+        except OSError:
+            pass
+    print(f"when-quiet{' (urgent)' if urgent else ''}: load {load1():.1f} < {load}, running: {' '.join(cmd)}", flush=True)
+    decided("ran", started, held_load, load, yielded, urgent, contended)
+    return subprocess.call(cmd)
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

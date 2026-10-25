@@ -1,0 +1,1477 @@
+#!/usr/bin/env python3
+"""mutant-check <worktree> [--base REF] [--max N] [--minutes M] [--lang java|ts|py] [--app-dir D] [--dry-run] [--keep] [--client C] [--java-home P] [--maven-args "…"] [--tests T,…] [--exclude-tests G,…]
+"""
+import argparse
+import fcntl
+import fnmatch
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _pyscript import SHEBANG_BYTES, is_python_script
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+RUN_QUEUED = os.path.join(BIN, "run-queued")
+PIT_VERSION = "1.30.0"
+PIT_JUNIT5_VERSION = "1.2.3"
+STRYKER_VERSION = "10.0.0"
+CACHE = os.path.expanduser(os.environ.get("IPHTAH_MUTANT_CACHE", "~/.cache/iphtah/mutant-check"))
+MUTANTS_PER_LINE = 1.5
+CAPPER = None
+NO_BOUND = ("memory cap: the test has no bound under this mutant (an endless input): give it a finite one, so the "
+            "mutant fails an assertion instead of filling the memory")
+
+
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+TEST_PATH = re.compile(r"(^|/)(test|tests|__tests__|e2e|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|Test\.java$|IT\.java$|Tests\.java$")
+SOURCE_EXT = {".java", ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}
+
+
+def changed_ranges(diff_text):
+    ""
+    out, path = {}, None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            name = line[4:].strip()
+            path = None if name == "/dev/null" else (name[2:] if name.startswith("b/") else name)
+            continue
+        m = HUNK.match(line)
+        if m and path:
+            start, count = int(m.group(1)), int(m.group(2)) if m.group(2) is not None else 1
+            if count > 0:
+                out.setdefault(path, []).append((start, start + count - 1))
+    return out
+
+
+def is_source(path):
+    return os.path.splitext(path)[1] in SOURCE_EXT and not TEST_PATH.search(path) and not path.endswith(".d.ts")
+
+
+PY_TEST_PATH = re.compile(r"(^|/)(test|tests)/|(^|/)(test_[^/]*\.py|[^/]*_test\.py|conftest\.py)$")
+
+
+def has_python_shebang(abs_path):
+    ""
+    try:
+        with open(abs_path, "rb") as f:
+            return is_python_script(f.readline(SHEBANG_BYTES))
+    except OSError:
+        return False
+
+
+def is_python(path, worktree=None):
+    ""
+    if PY_TEST_PATH.search(path):
+        return False
+    base = os.path.basename(path)
+    if base.endswith(".py"):
+        return True
+    return worktree is not None and "." not in base and has_python_shebang(os.path.join(worktree, path))
+
+
+
+SKIP = [
+    (re.compile(r"^\s*$"), "blank"),
+    (re.compile(r"^\s*(//|/\*|\*|#)"), "comment"),
+    (re.compile(r"^\s*[{}()\[\];,]*\s*$"), "brace"),
+    (re.compile(r"^\s*(import|package|export \* from|export \{|from )"), "import"),
+    (re.compile(r"^\s*@\w+"), "annotation"),
+    (re.compile(r"^\s*\}?\s*(else\s*)?\{?\s*$"), "brace"),
+    (re.compile(r"\b(log|logger|LOG|console)\s*\.\s*(debug|info|warn|warning|error|trace|log)\s*\("), "logging"),
+    (re.compile(r"^\s*(public|private|protected)?\s*(static\s+)?(final\s+)?(class|interface|record|enum)\b"), "declaration"),
+    (re.compile(r"^\s*(public|private|protected|export|default|async|function|static|final|override)[\w\s<>\[\],.?]*\(.*\)\s*(throws [\w., ]+)?\s*\{?\s*$"), "signature"),
+    (re.compile(r"^\s*\*/"), "comment"),
+    (re.compile(r"^\s*(public|private|protected|static|final|abstract|synchronized|default|export|async|function)\b[^;=]*\($"), "signature"),
+    (re.compile(r"^\s*(@\w+(\([^)]*\))?\s+)*[\w<>\[\],.?]+\s+\w+\s*[,)]+\s*(throws [\w., ]+)?\s*\{?\s*$"), "signature"),
+    (re.compile(r"^\s*(?!return\b|throw\b|if\b|for\b|while\b|new\b)[\w<>\[\],.?]+\s+\w+\s*\([^;={}]*,\s*$"), "signature"),
+    (re.compile(r"^\s*(async\s+)?def\s+\w+\s*\("), "signature"),
+    (re.compile(r"^\s*[rbuRBU]{0,2}(\"\"\"|''')"), "comment"),
+    (re.compile(r"^\s*(pass|else\s*:|try\s*:|finally\s*:|global\s+\w+|nonlocal\s+\w+)\s*$"), "brace"),
+]
+INERT = [
+    (re.compile(r"^\s*<[/\w]"), "jsx"),
+    (re.compile(r"^\s*(\"[^\"]*\"|'[^']*'|`[^`]*`)\s*[,;+]?\s*$"), "string"),
+    (re.compile(r"^\s*(type|interface)\s+\w+"), "type"),
+    (re.compile(r"^\s*\w+\??:\s*[\w<>\[\]|&\s.'\"]+;?\s*$"), "type"),
+]
+RISK = [
+    (10, "permission", re.compile(r"\b(hasRole|hasAuthority|isAllowed|canRead|canWrite|can[A-Z]\w*|permission|Permission|"
+                                   r"authorize|Authorize|forbid|Forbid|denied|Denied|AccessDenied|FORBIDDEN|UNAUTHORIZED|"
+                                   r"Operation\.\w+|Feature\.\w+|resolveAccess|requireRight|right\(|owner|Owner|scope|Scope)\b")),
+    (9, "where clause", re.compile(r"\b(WHERE|AND|OR|HAVING|LIMIT|OFFSET|ORDER BY)\b.*[<>=]|\bWHERE\b|\bAND\b.*\b(IS|IN|<|>|=)\b|"
+                                    r"\.(where|filter|having|and|or|not|eq|ne|lt|gt|le|ge|isNull|isNotNull|in)\(")),
+    (9, "money", re.compile(r"\b(amount|balance|price|cost|credit|debit|wallet|ledger|fee|total|rate|budget|quota|ceiling)\w*\b.*[-+*/]|"
+                            r"[-+*/]\s*\w*(amount|balance|price|cost|credit|debit|total|fee|rate)\b", re.I)),
+    (8, "boundary", re.compile(r"(<=|>=|[^<>=!]<[^<=]|[^<>=!-]>[^>=]|\bsize\(\)|\.length\b|\bisEmpty\(\)|\bMath\.(min|max)|\bcompareTo)")),
+    (8, "equality", re.compile(r"(===|!==|==|!=|\.equals\(|Objects\.equals|\bis\s+(not\s+)?None\b|\bIS (NOT )?NULL\b)")),
+    (7, "condition", re.compile(r"^\s*(\}\s*)?(if|else if|elif|while|switch|case|for)\b|\?\s*[^.:]+\s*:|\s\?\?\s|&&|\|\||"
+                                r"\b(and|or)\b|\bnot\s+in\b")),
+    (7, "throw", re.compile(r"\b(throw|raise|reject)\b")),
+    (6, "boolean return", re.compile(r"\breturn\s+(true|false|!|\w+\s*(==|!=|<|>|&&|\|\||===|!==)|\w+\.(is|has|can)\w*\()")),
+    (5, "negation", re.compile(r"(^|[^\w!=])!\s*[\w(]|\bnot\s+[\w(]")),
+    (4, "return", re.compile(r"\breturn\b")),
+    (4, "optional/nullish", re.compile(r"(\?\.|\.orElse|\.orElseThrow|\.isPresent\(\)|\.ifPresent|\?\?)")),
+    (3, "arithmetic", re.compile(r"[\w)\]]\s*[-+*/%]\s*[\w(]|\+\+|--|\+=|-=")),
+    (2, "call", re.compile(r"\w\(")),
+]
+
+
+def money_rule(terms):
+    ""
+    words = [re.escape(w) for w in (terms or ()) if isinstance(w, str) and w.strip()]
+    if not words:
+        return None
+    return (9, "money", re.compile(r"\b(" + "|".join(words) + r")\w*\b.*[-+*/]", re.I))
+
+
+def risk(line, money_terms=()):
+    ""
+    for rx, why in SKIP:
+        if rx.search(line):
+            return 0, why
+    for rx, why in INERT:
+        if rx.search(line):
+            return 0, why
+    best = (1, "statement")
+    line = re.sub(r"<[\w.?,\s\[\]]+>", "", line)
+    extra = money_rule(money_terms)
+    for score, why, rx in RISK + ([extra] if extra else []):
+        if rx.search(line):
+            if score > best[0]:
+                best = (score, why)
+    return best
+
+
+def rank_lines(files, money_terms=()):
+    ""
+    ranked = []
+    for path in files:
+        for lineno, text in files[path]:
+            score, why = risk(text, money_terms)
+            if score > 0:
+                ranked.append((score, path, lineno, why))
+    ranked.sort(key=lambda r: (-r[0], r[1], r[2]))
+    return ranked
+
+
+def select_lines(ranked, max_mutants, per_line=MUTANTS_PER_LINE):
+    ""
+    budget = max(1, int(math.floor(max_mutants / per_line))) if max_mutants else len(ranked)
+    return ranked[:budget]
+
+
+def ranges_of(lines):
+    ""
+    by_path = {}
+    for _, path, lineno, _ in lines:
+        by_path.setdefault(path, set()).add(lineno)
+    out = {}
+    for path, nums in by_path.items():
+        ranges, start, prev = [], None, None
+        for n in sorted(nums):
+            if start is None:
+                start = prev = n
+            elif n == prev + 1:
+                prev = n
+            else:
+                ranges.append((start, prev))
+                start = prev = n
+        ranges.append((start, prev))
+        out[path] = ranges
+    return out
+
+
+def in_ranges(lineno, ranges):
+    return any(a <= lineno <= b for a, b in ranges)
+
+
+
+METHOD_HEAD = re.compile(
+    r"^\s*(?:(?:public|private|protected|static|final|synchronized|abstract|default|native)\s+)*"
+    r"(?:<[^>]+>\s+)?(?!return\b|new\b|throw\b|else\b|case\b)([\w<>\[\],.?\s]+?)\s+(\w+)\s*\(")
+STATEMENT_WORDS = {"if", "for", "while", "switch", "catch", "return", "new", "else", "synchronized", "throw", "case"}
+
+
+def text_block_lines(source):
+    ""
+    inside, out = False, set()
+    for n, line in enumerate(source.splitlines(), 1):
+        if inside:
+            out.add(n)
+        if (line.count('\"\"\"') + line.count("'''")) % 2 == 1:
+            inside = not inside
+    return out
+
+
+def method_spans(source):
+    ""
+    blocks = text_block_lines(source)
+    lines = ["" if n in blocks else t for n, t in enumerate(source.splitlines(), 1)]
+    spans, i = [], 0
+    while i < len(lines):
+        m = METHOD_HEAD.match(lines[i])
+        name = m.group(2) if m and "=" not in m.group(1) and not STATEMENT_WORDS & set(m.group(1).split()) else None
+        if name and name not in STATEMENT_WORDS:
+            depth, opened, j = 0, False, i
+            while j < len(lines):
+                text = re.sub(r'"(\\.|[^"\\])*"', '""', lines[j])
+                text = re.sub(r"//.*$", "", text)
+                for ch in text:
+                    if ch == "{":
+                        depth += 1
+                        opened = True
+                    elif ch == "}":
+                        depth -= 1
+                if ";" in text and not opened:
+                    break
+                if opened and depth == 0:
+                    break
+                j += 1
+            if opened:
+                spans.append((name, i + 1, j + 1))
+            i = j + 1 if opened else i + 1
+        else:
+            i += 1
+    return spans
+
+
+def java_class_of(path):
+    ""
+    m = re.search(r"src/(?:main|test)/java/(.+)\.java$", path)
+    return m.group(1).replace("/", ".") if m else None
+
+
+def java_targets(worktree, ranges):
+    ""
+    classes, keep, drop = [], set(), set()
+    for path, rs in ranges.items():
+        cls = java_class_of(path)
+        if not cls:
+            continue
+        classes.append(cls)
+        try:
+            spans = method_spans(open(os.path.join(worktree, path), encoding="utf-8").read())
+        except OSError:
+            spans = []
+        for name, start, end in spans:
+            if any(a <= end and b >= start for a, b in rs):
+                keep.add(name)
+            else:
+                drop.add(name)
+    excluded = sorted(drop - keep)
+    return classes, excluded + [f"lambda${m}$*" for m in excluded], sorted(keep)
+
+
+def java_tests(worktree, changed_paths, classes, methods, exclude_globs):
+    ""
+    test_root = os.path.join(worktree, "src", "test", "java")
+    found = {java_class_of(p) for p in changed_paths if p.endswith(".java") and "/src/test/" in "/" + p}
+    found.discard(None)
+    simple = [c.rsplit(".", 1)[-1] for c in classes]
+    by_method, by_class = set(), set()
+    for root, _, names in os.walk(test_root):
+        for n in names:
+            if not n.endswith(".java"):
+                continue
+            p = os.path.join(root, n)
+            try:
+                text = open(p, encoding="utf-8").read()
+            except OSError:
+                continue
+            fq = java_class_of(os.path.relpath(p, worktree))
+            if methods and any(re.search(r"\b" + re.escape(m) + r"\b", text) for m in methods):
+                by_method.add(fq)
+            if any(re.search(r"\b" + re.escape(s) + r"\b", text) for s in simple):
+                by_class.add(fq)
+    found |= by_method
+    if not found:
+        found = by_class
+    out = []
+    for fq in sorted(found):
+        if any(_glob_match(g, fq) for g in exclude_globs):
+            continue
+        out.append(fq)
+    return out
+
+
+def _glob_match(glob, fq):
+    simple = fq.rsplit(".", 1)[-1]
+    g = glob.replace("**/", "").replace(".java", "")
+    rx = "^" + re.escape(g).replace(r"\*", ".*") + "$"
+    return re.match(rx, simple) is not None or re.match(rx, fq) is not None
+
+
+def pom_excludes(pom_text):
+    ""
+    return re.findall(r"<exclude>\s*([^<]+?)\s*</exclude>", pom_text)
+
+
+def pom_with_pit(pom_text):
+    ""
+    plugin = f"""
+      <plugin><!-- added by mutant-check, in a scratch copy of the pom; never committed -->
+        <groupId>org.pitest</groupId>
+        <artifactId>pitest-maven</artifactId>
+        <version>{PIT_VERSION}</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.pitest</groupId>
+            <artifactId>pitest-junit5-plugin</artifactId>
+            <version>{PIT_JUNIT5_VERSION}</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+"""
+    build = pom_text.find("<build>")
+    if build < 0:
+        return pom_text.replace("</project>", f"<build><plugins>{plugin}</plugins></build></project>")
+    plugins = pom_text.find("<plugins>", build)
+    if plugins < 0:
+        return pom_text[:build + 7] + f"<plugins>{plugin}</plugins>" + pom_text[build + 7:]
+    at = plugins + len("<plugins>")
+    return pom_text[:at] + plugin + pom_text[at:]
+
+
+
+class Mutant:
+    __slots__ = ("path", "line", "change", "status", "killed_by", "in_scope")
+
+    def __init__(self, path, line, change, status, killed_by="", in_scope=True):
+        self.path, self.line, self.change = path, line, change
+        self.status, self.killed_by, self.in_scope = status, killed_by, in_scope
+
+    def row(self):
+        s = self.status + (f" (by {self.killed_by})" if self.status == "KILLED" and self.killed_by else "")
+        return f"{self.path}:{self.line}  {self.change}  →  {s}"
+
+
+PIT_STATUS = {"KILLED": "KILLED", "SURVIVED": "SURVIVED", "NO_COVERAGE": "NO COVERAGE", "TIMED_OUT": "TIMEOUT",
+              "MEMORY_ERROR": "NO VERDICT", "RUN_ERROR": "ERROR", "NON_VIABLE": "ERROR"}
+
+
+def killing_test(raw):
+    ""
+    cls = re.search(r"\[class:([\w.$]+)\]", raw)
+    meth = re.search(r"\[method:(\w+)", raw)
+    if cls and meth:
+        return cls.group(1).rsplit(".", 1)[-1] + "." + meth.group(1)
+    head = raw.split("(")[0]
+    parts = head.rsplit(".", 2)
+    return ".".join(parts[-2:]) if len(parts) >= 2 else head
+
+
+def parse_pit_xml(text, ranges):
+    ""
+    root = ET.fromstring(text)
+    by_class = {}
+    for path in ranges:
+        cls = java_class_of(path)
+        if cls:
+            by_class[cls] = path
+    out = []
+    for m in root.iter("mutation"):
+        cls = (m.findtext("mutatedClass") or "").split("$")[0]
+        path = by_class.get(cls)
+        if path is None:
+            src = m.findtext("sourceFile") or ""
+            path = next((p for p in ranges if p.endswith("/" + src)), src)
+        line = int(m.findtext("lineNumber") or 0)
+        mutator = (m.findtext("mutator") or "").rsplit(".", 1)[-1]
+        desc = m.findtext("description") or mutator
+        status = PIT_STATUS.get(m.get("status", ""), m.get("status", "?"))
+        killer = killing_test(m.findtext("killingTest") or "")
+        out.append(Mutant(path, line, desc, status, killer, in_ranges(line, ranges.get(path, []))))
+    return out
+
+
+STRYKER_STATUS = {"Killed": "KILLED", "Survived": "SURVIVED", "NoCoverage": "NO COVERAGE", "Timeout": "TIMEOUT",
+                  "CompileError": "ERROR", "RuntimeError": "ERROR", "Ignored": "IGNORED", "Pending": "?"}
+
+
+def parse_stryker_json(text, ranges, root=""):
+    ""
+    rep = json.loads(text)
+    tests = {}
+    for tf in rep.get("testFiles", {}).values():
+        for t in tf.get("tests", []):
+            tests[t["id"]] = t.get("name", t["id"])
+    out = []
+    for rel, f in rep.get("files", {}).items():
+        path = os.path.normpath(os.path.join(root, rel)) if root else rel
+        for m in f.get("mutants", []):
+            line = m["location"]["start"]["line"]
+            change = f"{m.get('mutatorName', '?')}: {m.get('replacement', '')}".strip()[:80]
+            status = STRYKER_STATUS.get(m.get("status"), m.get("status", "?"))
+            killer = ", ".join(tests.get(t, t) for t in m.get("killedBy", [])[:1])
+            out.append(Mutant(path, line, change, status, killer, in_ranges(line, ranges.get(path, []))))
+    return out
+
+
+def summarize(mutants):
+    ""
+    scoped = [m for m in mutants if m.in_scope]
+    lines = [m.row() for m in scoped]
+    timeouts = sum(1 for m in scoped if m.status == "TIMEOUT")
+    killed = sum(1 for m in scoped if m.status == "KILLED") + timeouts
+    no_verdict = sum(1 for m in scoped if m.status == "NO VERDICT")
+    counts = {}
+    for m in scoped:
+        if m.status in ("SURVIVED", "NO COVERAGE"):
+            counts[f"{m.path}:{m.line}"] = counts.get(f"{m.path}:{m.line}", 0) + 1
+    survivors = [k + (f" (x{n})" if n > 1 else "") for k, n in counts.items()]
+    outside = len(mutants) - len(scoped)
+    tail = f"guards proved: {killed}/{len(scoped)}; survivors: " + (", ".join(survivors) if survivors else "none")
+    if timeouts:
+        tail += f"; {timeouts} of them by timeout"
+    if no_verdict:
+        tail += f"; {no_verdict} no verdict ({NO_BOUND})"
+    if outside:
+        tail += f"; {outside} mutant(s) outside the chosen lines run and not listed"
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+
+def capped(cmd, result, repo, what, cap_kib=None, mutant=False):
+    ""
+    if CAPPER is None:
+        return cmd
+    who = ["--client", repo["client"]] if repo and repo.get("client") else []
+    return [sys.executable, CAPPER, "capped", (repo or {}).get("repo") or "-", *who, "--cmd", f"mutant-check {what}",
+            "--for", "mutant-check", "--record", *(["--cap-kib", str(int(cap_kib))] if cap_kib else []),
+            *(["--mutant"] if mutant else []), "--result-file", result, "--", *cmd]
+
+
+def admit_run(repo, what):
+    ""
+    if CAPPER is None or not (repo and repo.get("client")):
+        return None, None
+    r = subprocess.run([sys.executable, CAPPER, "admit", repo.get("repo") or "-", "--client", repo["client"], "--cmd",
+                        f"mutant-check {what}", "--owner-pid", str(os.getpid())], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    fields = r.stdout.rstrip("\n").split("\t")
+    if r.returncode == 87:
+        return None, fields[3] if len(fields) > 3 else "it never had room"
+    if r.returncode == 0 and len(fields) > 3 and fields[0] == "here" and fields[2].isdigit():
+        return int(fields[2]), None
+    return None, None
+
+
+def cap_result(result):
+    ""
+    try:
+        with open(result, encoding="utf-8") as fh:
+            out = dict(line.rstrip("\n").split("=", 1) for line in fh if "=" in line)
+    except OSError:
+        out = {}
+    for done in (result, result + ".oom", result + ".oom.cg"):
+        try:
+            os.remove(done)
+        except OSError:
+            pass
+    return out
+
+
+def _count(res, key):
+    try:
+        return int(res.get(key) or 0)
+    except ValueError:
+        return 0
+
+
+def oom_kills(res):
+    return _count(res, "oom_kill")
+
+
+def memory_hit(res):
+    ""
+    return any(_count(res, k) for k in ("oom_kill", "oom", "high"))
+
+
+def cap_said(res):
+    ""
+    if res.get("no_room") == "1":
+        print(f"  not run: {res.get('note', '?')}: no verdict")
+    elif res.get("capped") == "0":
+        print(f"  not capped: {res.get('note', '?')}")
+    elif oom_kills(res):
+        print(f"  memory cap: {res.get('cap', '?')} reached: the OOM killer stopped {oom_kills(res)} process(es) of this "
+              f"run in its own scope ({NO_BOUND})")
+    elif memory_hit(res):
+        print(f"  memory cap: {res.get('cap', '?')} met (memory events, no kill) during this run")
+
+
+def after_the_cap(mutants, res):
+    ""
+    if memory_hit(res):
+        hit = [m for m in mutants if m.in_scope and m.status in ("TIMEOUT", "ERROR")]
+        for m in hit:
+            m.status = "NO VERDICT"
+        if hit:
+            print(f"  {len(hit)} TIMEOUT/ERROR verdict(s) made NO VERDICT: the run met its memory cap")
+    return mutants
+
+def sh(cmd, cwd=None, timeout=None, env=None, log=None):
+    ""
+    start = time.time()
+    with open(log, "ab") if log else open(os.devnull, "wb") as out:
+        out.write(("\n$ " + " ".join(shlex.quote(c) for c in cmd) + "\n").encode())
+        out.flush()
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=env)
+        try:
+            code = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            code = 124
+    tail = ""
+    if log and os.path.exists(log):
+        with open(log, "rb") as f:
+            f.seek(max(0, os.path.getsize(log) - 4000))
+            tail = f.read().decode(errors="replace")
+    return code, tail, time.time() - start
+
+
+def git(worktree, *a):
+    return subprocess.run(["git", "-C", worktree, *a], capture_output=True).stdout.decode("utf-8", errors="replace")
+
+
+def detect_lang(paths, worktree=None):
+    ""
+    if any(p.endswith(".java") for p in paths):
+        return "java"
+    ts = sum(1 for p in paths if os.path.splitext(p)[1] in SOURCE_EXT)
+    py = sum(1 for p in paths if is_python(p, worktree))
+    if py > ts:
+        return "py"
+    return "ts" if ts else ("py" if py else None)
+
+
+def app_dir_of(worktree, paths):
+    ""
+    for p in paths:
+        d = os.path.dirname(p)
+        while d:
+            if os.path.exists(os.path.join(worktree, d, "package.json")):
+                return d
+            d = os.path.dirname(d)
+    return "."
+
+
+def run_java(a, worktree, ranges, changed_paths, scratch, log, repo):
+    pom_path = os.path.join(worktree, "pom.xml")
+    pom = open(pom_path, encoding="utf-8").read()
+    classes, excluded, methods = java_targets(worktree, ranges)
+    excludes = list(a.exclude_tests or []) + pom_excludes(pom)
+    tests = a.tests or java_tests(worktree, changed_paths, classes, methods, excludes)
+    if not tests:
+        print("mutant-check: no test names a changed class or method, and the branch changes no test:\n"
+              "  nothing can prove these guards yet — write the test first.")
+        return 0
+    java_home = a.java_home or (re.search(r"JAVA_HOME=(\S+)", repo.get("build", "")) or [None, None])[1]
+    maven_args = shlex.split(a.maven_args) if a.maven_args else re.findall(r"(-P\S+)", repo.get("build", ""))
+    scratch_pom = os.path.join(worktree, "pom.mutant-check.xml")
+    reports = os.path.join(scratch, "pit")
+    cap_file = os.path.join(scratch, "cap.result")
+    cmd = [*capped([], cap_file, repo, "java"), RUN_QUEUED, "maven", "--", "./mvnw", "-B", "-f", scratch_pom, *maven_args,
+           "test-compile", f"org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage",
+           "-DtargetClasses=" + ",".join(classes),
+           "-DtargetTests=" + ",".join(tests),
+           f"-DreportsDirectory={reports}", "-DoutputFormats=XML,HTML", "-DtimestampedReports=false",
+           "-DfailWhenNoMutations=false", "-Dthreads=1", "-DtimeoutConstant=45000",
+           "-Dskip.npm", "-Dskip.installnodenpm", "-Dmaven.javadoc.skip=true"]
+    if excluded:
+        cmd.append("-DexcludedMethods=" + ",".join(excluded))
+    print(f"mutant-check: java — classes {classes}; methods kept {methods or '(all)'}; "
+          f"{len(excluded) // 2} other method(s) excluded (and their lambdas); tests {tests}")
+    if a.dry_run:
+        shown = " ".join(shlex.quote(c) for c in cmd)
+        print("  would run: " + (shown if len(shown) < 1500 else shown[:1500] + f" …(+{len(shown) - 1500} chars)"))
+        return 0
+    env = dict(os.environ)
+    if java_home:
+        env["JAVA_HOME"] = java_home
+    before = git(worktree, "status", "--porcelain")
+    open(scratch_pom, "w", encoding="utf-8").write(pom_with_pit(pom))
+    try:
+        code, tail, secs = sh(cmd, cwd=worktree, timeout=a.minutes * 60, env=env, log=log)
+    finally:
+        if not a.keep:
+            try:
+                os.remove(scratch_pom)
+            except OSError:
+                pass
+    after = git(worktree, "status", "--porcelain")
+    res = cap_result(cap_file)
+    xml_path = os.path.join(reports, "mutations.xml")
+    print(f"mutant-check: maven exit {code} after {secs / 60:.1f} min; log {log}")
+    cap_said(res)
+    if code == 124:
+        print(f"  the run exceeded --minutes {a.minutes}; no report. Lower --max or raise --minutes.")
+    if not os.path.exists(xml_path):
+        if re.search(r"tests did not pass without mutation|Tests failing without mutation", tail, re.I):
+            print("  the tests fail BEFORE any mutation, so nothing can be proved; fix them first "
+                  "(a red suite at review wastes the review). Log: " + log)
+        else:
+            print("  no PIT report produced. Last lines of the log:\n" + tail)
+        return 0
+    mutants = after_the_cap(parse_pit_xml(open(xml_path, encoding="utf-8").read(), ranges), res)
+    print(summarize(mutants))
+    print(f"  html: {os.path.join(reports, 'index.html')}")
+    if before != after:
+        print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
+    return 0
+
+
+def project_package(app_abs, worktree, name):
+    ""
+    for base in (app_abs, worktree):
+        p = os.path.join(base, "node_modules", name)
+        if os.path.exists(os.path.join(p, "package.json")):
+            return os.path.realpath(p)
+    return None
+
+
+def plugin_entry(pkg_dir):
+    ""
+    meta = json.load(open(os.path.join(pkg_dir, "package.json")))
+    entry = meta.get("exports", {}).get(".") if isinstance(meta.get("exports"), dict) else None
+    if isinstance(entry, dict):
+        entry = entry.get("import") or entry.get("default")
+    return os.path.join(pkg_dir, entry or meta.get("main") or "index.js")
+
+
+def stryker_install(links):
+    ""
+    key = re.sub(r"\W+", "_", "|".join(f"{k}={v}" for k, v in sorted(links.items())))[-80:]
+    d = os.path.join(CACHE, f"stryker-{STRYKER_VERSION}-{key}")
+    bin_ = os.path.join(d, "node_modules", ".bin", "stryker")
+    if os.path.exists(bin_):
+        return d, bin_
+    os.makedirs(d, exist_ok=True)
+    deps = {"@stryker-mutator/core": STRYKER_VERSION, "@stryker-mutator/vitest-runner": STRYKER_VERSION}
+    deps.update({k: "link:" + v for k, v in links.items()})
+    json.dump({"name": "mutant-check-stryker", "private": True, "dependencies": deps},
+              open(os.path.join(d, "package.json"), "w"), indent=1)
+    pm = ["pnpm", "install", "--silent"] if shutil.which("pnpm") else ["npm", "install", "--silent", "--no-audit"]
+    r = subprocess.run(pm, cwd=d, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(bin_):
+        sys.exit(f"mutant-check: could not install Stryker in {d}:\n{r.stderr[-2000:]}")
+    return d, bin_
+
+
+def run_ts(a, worktree, ranges, scratch, log, changed_paths=(), repo=None):
+    ""
+    by_app = {}
+    for path, rs in ranges.items():
+        by_app.setdefault(a.app_dir or app_dir_of(worktree, [path]), {})[path] = rs
+    code = 0
+    for n, (app, app_ranges) in enumerate(sorted(by_app.items())):
+        code = run_ts_app(a, worktree, app, app_ranges, scratch, log.replace(".log", f".{n}.log") if n else log,
+                          changed_paths, repo) or code
+    return code
+
+
+TS_IMPORT = re.compile(r"""(?:from|import|require\()\s*['"]([^'"]+)['"]""")
+
+
+def vitest_tests_for(app_abs, mutated_rel, changed_tests_rel):
+    ""
+    targets = {os.path.splitext(os.path.normpath(m))[0] for m in mutated_rel}
+    out = set(changed_tests_rel)
+    for root, dirs, names in os.walk(app_abs):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", "build", ".stryker-tmp", "coverage")]
+        for n in names:
+            if not re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", n):
+                continue
+            path = os.path.join(root, n)
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for spec in TS_IMPORT.findall(text):
+                if not spec.startswith("."):
+                    continue
+                resolved = os.path.normpath(os.path.join(os.path.dirname(path), spec))
+                rel = os.path.splitext(os.path.relpath(resolved, app_abs))[0]
+                if rel in targets or rel + "/index" in targets:
+                    out.add(os.path.relpath(path, app_abs))
+                    break
+    return sorted(out)
+
+
+def scratch_vitest_config(base_config, tests):
+    ""
+    base = "./" + os.path.splitext(base_config)[0]
+    return ("// written by mutant-check; untracked, deleted after the run\n"
+            "import { mergeConfig } from 'vitest/config';\n"
+            f"import base from '{base}';\n"
+            f"export default mergeConfig(base, {{ test: {{ include: {json.dumps(tests)} }} }});\n")
+
+
+def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=None):
+    app_abs = os.path.join(worktree, app)
+    vitest = os.path.join(app_abs, "node_modules", "vitest")
+    if not os.path.exists(vitest):
+        print(f"mutant-check: {app}/node_modules/vitest is missing — install the project first (pnpm install).")
+        return 0
+    mutate = []
+    for path, rs in ranges.items():
+        rel = os.path.relpath(os.path.join(worktree, path), app_abs)
+        mutate += [f"{rel}:{s}-{e}" for s, e in rs]
+    config_file = next((f for f in ("vitest.config.ts", "vitest.config.mts", "vitest.config.js", "vite.config.ts",
+                                    "vite.config.mts") if os.path.exists(os.path.join(app_abs, f))), None)
+    mutated_rel = [m.split(":")[0] for m in mutate]
+    changed_tests = [os.path.relpath(os.path.join(worktree, p), app_abs) for p in changed_paths
+                     if TEST_PATH.search(p) and os.path.splitext(p)[1] in SOURCE_EXT
+                     and not os.path.relpath(os.path.join(worktree, p), app_abs).startswith("..")]
+    tests = vitest_tests_for(app_abs, mutated_rel, changed_tests)
+    if not tests:
+        print(f"mutant-check: ts — app {app}: no test imports {mutated_rel} and the branch changes no test there:\n"
+              "  nothing can prove these guards yet — write the test first.")
+        return 0
+    scratch_config = None
+    if config_file:
+        scratch_config = "vitest.mutant-check.config" + os.path.splitext(config_file)[1]
+    tag = re.sub(r"\W+", "_", app)
+    report = os.path.join(scratch, f"stryker-{tag}.json")
+    config = {
+        "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+        "mutate": mutate,
+        "testRunner": "vitest",
+        "coverageAnalysis": "perTest",
+        "vitest": {"related": True, **({"configFile": scratch_config or config_file} if config_file else {})},
+        "reporters": ["json", "progress"],
+        "jsonReporter": {"fileName": report},
+        "tempDirName": os.path.join(scratch, f"stryker-tmp-{tag}"),
+        "cleanTempDir": "always",
+        "concurrency": 1,
+        "ignoreStatic": True,
+        "disableTypeChecks": True,
+        "incremental": False,
+        "allowEmpty": True,
+        "timeoutMS": 10000,
+        "dryRunTimeoutMinutes": max(1, a.minutes // 2),
+        "logLevel": "info",
+    }
+    print(f"mutant-check: ts — app {app}; ranges {mutate}; tests {tests}")
+    if a.dry_run:
+        print("  config: " + json.dumps(config))
+        print(f"  would run: {RUN_QUEUED} vitest -- <cache>/node_modules/.bin/stryker run <scratch>/stryker-{tag}.conf.json")
+        return 0
+    links = {"vitest": os.path.realpath(vitest)}
+    ts = project_package(app_abs, worktree, "typescript")
+    if ts:
+        links["typescript"] = ts
+    inst, stryker_bin = stryker_install(links)
+    config["plugins"] = [plugin_entry(os.path.join(inst, "node_modules", "@stryker-mutator", "vitest-runner"))]
+    conf_path = os.path.join(scratch, f"stryker-{tag}.conf.json")
+    json.dump(config, open(conf_path, "w"), indent=1)
+    cap_file = os.path.join(scratch, f"cap-{tag}.result")
+    cmd = capped([RUN_QUEUED, "vitest", "--", stryker_bin, "run", conf_path], cap_file, repo, "ts")
+    before = git(worktree, "status", "--porcelain")
+    if scratch_config:
+        with open(os.path.join(app_abs, scratch_config), "w", encoding="utf-8") as f:
+            f.write(scratch_vitest_config(config_file, tests))
+    try:
+        code, tail, secs = sh(cmd, cwd=app_abs, timeout=a.minutes * 60, log=log)
+    finally:
+        if scratch_config and not a.keep:
+            try:
+                os.remove(os.path.join(app_abs, scratch_config))
+            except OSError:
+                pass
+    after = git(worktree, "status", "--porcelain")
+    res = cap_result(cap_file)
+    print(f"mutant-check: stryker exit {code} after {secs / 60:.1f} min; log {log}")
+    cap_said(res)
+    if code == 124:
+        print(f"  the run exceeded --minutes {a.minutes}; no report. Lower --max or raise --minutes.")
+    if not os.path.exists(report):
+        failed = re.search(r"One or more tests failed in the initial test run:\n(.*?)\n\S", tail, re.S)
+        if failed:
+            print("  the tests fail BEFORE any mutation, so nothing can be proved:\n    "
+                  + failed.group(1).strip().replace("\n", "\n    ")
+                  + "\n  fix that test first (a red suite at review wastes the review).")
+        else:
+            print("  no Stryker report produced. Last lines of the log:\n" + tail)
+        return 0
+    mutants = after_the_cap(parse_stryker_json(open(report, encoding="utf-8").read(), ranges,
+                                               root=app if app != "." else ""), res)
+    print(summarize(mutants))
+    if before != after:
+        print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
+    return 0
+
+
+
+PY_STR = re.compile(r'("""(?:\\.|[^\\])*?"""|\'\'\'(?:\\.|[^\\])*?\'\'\'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')')
+
+
+def py_string_lines(source):
+    ""
+    import io
+    import tokenize
+    out = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.STRING and tok.end[0] > tok.start[0]:
+                out.update(range(tok.start[0] + 1, tok.end[0] + 1))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return text_block_lines(source)
+    return out
+
+
+def py_code_end(line):
+    ""
+    hash_ = PY_STR.sub(lambda m: " " * len(m.group(0)), line).find("#")
+    return len(line) if hash_ < 0 else hash_
+
+
+def py_masked(line):
+    ""
+    out = PY_STR.sub(lambda m: " " * len(m.group(0)), line)
+    end = py_code_end(line)
+    return out[:end] + " " * (len(out) - end)
+
+
+def _splice(line, start, end, new):
+    return line[:start] + new + line[end:]
+
+
+PY_CMP = {"==": "!=", "!=": "==", "<=": "<", ">=": ">", "<": "<=", ">": ">="}
+PY_CMP_RX = re.compile(r"(?<![<>=!\-:])(==|!=|<=|>=|<|>)(?![<>=])")
+PY_HEAD = re.compile(r"^(\s*)(if|elif|while)\s+(.+?):\s*$")
+PY_RETURN = re.compile(r"^(\s*)return\b\s*(.*?)\s*$")
+PY_STMT = re.compile(r"^(\s*)(raise\b.*|continue|break)\s*$")
+PY_NOT = re.compile(r"(?<!\bis\s)\bnot\s+(?=[\w(])")
+PY_NUM = re.compile(r"(?<![\w.])(\d+)(?![\w.])")
+PY_ARITH = re.compile(r"(?<=[\w)\]])\s*([-+])\s*(?=[\w(])")
+
+
+def py_mutations(line):
+    ""
+    out = []
+    code = py_masked(line)
+    m = PY_HEAD.match(code)
+    if m:
+        indent, kw, masked_cond = m.groups()
+        cond = line[m.start(3):m.end(3)]
+        atom = PY_CMP_RX.search(masked_cond) or re.search(r"\bis\s+(not\s+)?None\b|\b(not\s+)?in\b", masked_cond) \
+            or re.match(r"\s*not\s", masked_cond)
+        simple = not re.search(r"\b(and|or)\b", masked_cond) and atom is not None
+        if kw == "while":
+            out.append(("while → while False", f"{indent}while False:" + line[m.end(3) + 1:]))
+        elif not simple:
+            out.append((f"{kw} cond → {kw} not (cond)", f"{indent}{kw} not ({cond}):" + line[m.end(3) + 1:]))
+    for m in PY_CMP_RX.finditer(code):
+        op = m.group(1)
+        out.append((f"{op} → {PY_CMP[op]}", _splice(line, m.start(1), m.end(1), PY_CMP[op])))
+        break
+    m = re.search(r"\bis\s+not\s+None\b", code) or re.search(r"\bis\s+None\b", code)
+    if m:
+        new = "is None" if "not" in m.group(0) else "is not None"
+        out.append((f"{' '.join(m.group(0).split())} → {new}", _splice(line, m.start(), m.end(), new)))
+    if not re.search(r"\bfor\b", code):
+        m = re.search(r"\bnot\s+in\b", code) or re.search(r"(?<!\bnot\s)\bin\b", code)
+        if m:
+            new = "in" if m.group(0).startswith("not") else "not in"
+            out.append((f"{' '.join(m.group(0).split())} → {new}", _splice(line, m.start(), m.end(), new)))
+    m = re.search(r"\b(and|or)\b", code)
+    if m:
+        new = "or" if m.group(1) == "and" else "and"
+        out.append((f"{m.group(1)} → {new}", _splice(line, m.start(), m.end(), new)))
+    m = PY_NOT.search(code)
+    if m:
+        out.append(("not dropped", _splice(line, m.start(), m.end(), "")))
+    m = PY_RETURN.match(code)
+    if m:
+        after = m.end(1) + len("return")
+        indent, value = m.group(1), line[after:py_code_end(line)].strip()
+        if value == "True":
+            out.append(("return True → return False", f"{indent}return False"))
+        elif value == "False":
+            out.append(("return False → return True", f"{indent}return True"))
+        elif value and value != "None":
+            out.append(("return x → return None", f"{indent}return None"))
+        else:
+            out.append(("return → return True", f"{indent}return True"))
+    m = PY_STMT.match(code)
+    if m:
+        out.append((f"{m.group(2).split()[0]} → pass", f"{m.group(1)}pass"))
+    m = re.search(r"\b(True|False)\b", code)
+    if m:
+        new = "False" if m.group(1) == "True" else "True"
+        out.append((f"{m.group(1)} → {new}", _splice(line, m.start(), m.end(), new)))
+    m = PY_NUM.search(code)
+    if m:
+        n = int(m.group(1))
+        out.append((f"{n} → {n + 1}", _splice(line, m.start(1), m.end(1), str(n + 1))))
+    m = PY_ARITH.search(code)
+    if m:
+        new = "-" if m.group(1) == "+" else "+"
+        out.append((f"{m.group(1)} → {new}", _splice(line, m.start(1), m.end(1), new)))
+    return [(d, l) for d, l in out if l != line]
+
+
+def py_mutants(sources, files, ranked, max_mutants, per_line=2):
+    ""
+    out, viable = [], {}
+    for score, path, lineno, why in ranked:
+        text = dict(files[path]).get(lineno)
+        if text is None or path not in sources:
+            continue
+        lines = sources[path].splitlines(True)
+        eol = "\n" if lines[lineno - 1].endswith("\n") else ""
+        for desc, new in py_mutations(text):
+            try:
+                compile("".join(lines[:lineno - 1] + [new + eol] + lines[lineno:]), path, "exec")
+            except (SyntaxError, ValueError):
+                continue
+            viable.setdefault((path, lineno), []).append((path, lineno, desc, new))
+    for nth in range(per_line):
+        for score, path, lineno, why in ranked:
+            if max_mutants and len(out) >= max_mutants:
+                return out
+            if len(viable.get((path, lineno), ())) > nth:
+                out.append(viable[(path, lineno)][nth])
+    return out
+
+
+def py_tests_dir(repo):
+    ""
+    m = re.search(r"discover\s+(?:.*\s)?-s\s+(\S+)", repo.get("build", "") or "")
+    return m.group(1) if m else "tests"
+
+
+def py_tests_for(worktree, tests_dir, mutated_paths, changed_paths):
+    ""
+    root = os.path.join(worktree, tests_dir)
+    names = {}
+    for p in mutated_paths:
+        base = os.path.basename(p)
+        stem = base[:-3] if base.endswith(".py") else base
+        names[stem] = re.compile(r"(?<![\w/.-])" + re.escape(stem) + r"(?![\w-])")
+    found = set()
+    for p in changed_paths:
+        if p.startswith(tests_dir + "/") and os.path.basename(p).startswith("test_") and p.endswith(".py"):
+            found.add(p)
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", "fixtures")]
+        for n in files:
+            if not (n.startswith("test_") and n.endswith(".py")):
+                continue
+            p = os.path.join(dirpath, n)
+            rel = os.path.relpath(p, worktree)
+            if n[5:-3] in {s.replace("-", "_") for s in names}:
+                found.add(rel)
+                continue
+            try:
+                text = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if any(rx.search(text) for rx in names.values()):
+                found.add(rel)
+    return sorted(os.path.splitext(os.path.basename(f))[0] for f in found)
+
+
+PY_FAIL = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)", re.M)
+STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+
+
+def _killpg(p):
+    ""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        p.kill()
+
+
+def py_run_tests(worktree, tests, timeout, log, tests_dir="tests", repo=None, cap_kib=None, mutant=False):
+    ""
+    cap_file = os.path.join(os.path.dirname(os.path.abspath(log)), f"cap-{os.getpid()}.result")
+    cmd = capped([sys.executable, "-W", "ignore", "-m", "unittest", "-f", *tests], cap_file, repo, "py", cap_kib, mutant)
+    path = os.path.join(worktree, tests_dir) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path,
+               PYTHONPYCACHEPREFIX=os.path.join(os.path.dirname(os.path.abspath(log)), "pycache"),
+               IPHTAH_QUEUE_DIR=os.path.join(os.path.dirname(os.path.abspath(log)), "queue"))
+    start = time.time()
+    with open(log, "ab") as out:
+        out.write(("\n$ " + " ".join(shlex.quote(c) for c in cmd) + "\n").encode())
+    p = subprocess.Popen(cmd, cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                         start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if CAPPER is not None:
+            p.send_signal(signal.SIGTERM)
+            try:
+                p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                pass
+        _killpg(p)
+        p.communicate()
+        with open(log, "ab") as f:
+            f.write(b"(timeout: the test run and its process group were killed)\n")
+        res = cap_result(cap_file)
+        if memory_hit(res):
+            return "oom", res.get("cap", "?"), time.time() - start
+        return "timeout", "", time.time() - start
+    except BaseException:
+        _killpg(p)
+        p.wait()
+        cap_result(cap_file)
+        raise
+    with open(log, "ab") as f:
+        f.write((out + err).encode(errors="replace"))
+    res = cap_result(cap_file)
+    if res.get("no_room") == "1":
+        return "oom", res.get("note", "never had room"), time.time() - start
+    if oom_kills(res):
+        return "oom", res.get("cap", "?"), time.time() - start
+    if p.returncode == 0:
+        return "green", "", time.time() - start
+    m = PY_FAIL.search(err) or PY_FAIL.search(out)
+    killer = ".".join(m.group(2).rsplit(".", 2)[-2:]) if m else "(unittest exit %d)" % p.returncode
+    return "red", killer, time.time() - start
+
+
+def dirty_paths(worktree):
+    ""
+    return [l[3:] for l in git(worktree, "status", "--porcelain", "--untracked-files=no").splitlines() if l.strip()]
+
+
+def git_bytes(worktree, *a):
+    r = subprocess.run(["git", "-C", worktree, *a], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def git_dir(worktree):
+    return git(worktree, "rev-parse", "--absolute-git-dir").strip()
+
+
+def _raise_exit(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def atomic_write(abs_path, data, mode, times):
+    ""
+    d = os.path.dirname(abs_path)
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".mutant-check-", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, stat_mode(mode))
+            os.utime(tmp, times)
+            os.replace(tmp, abs_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def stat_mode(mode):
+    return mode & 0o7777
+
+
+def _read(abs_path):
+    try:
+        with open(abs_path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _alarm(text):
+    print("mutant-check: " + text, flush=True)
+    print("mutant-check: " + text, file=sys.stderr, flush=True)
+
+
+def _keep_original(original, keep_dir, abs_path):
+    ""
+    side = os.path.join(keep_dir, os.path.basename(abs_path) + ".original")
+    try:
+        with open(side, "wb") as f:
+            f.write(original)
+    except OSError:
+        side = "(could not be saved: " + side + ")"
+    return side
+
+
+def py_mutate_and_run(abs_path, original, mutated_text, mtime_shift, run, marker=None, keep_dir=None):
+    ""
+    st = os.stat(abs_path)
+    mutant = mutated_text.encode("utf-8")
+    keep_dir = keep_dir or os.path.dirname(abs_path)
+    if marker:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(abs_path + "\n")
+    written = False
+    try:
+        atomic_write(abs_path, mutant, st.st_mode, (st.st_atime, st.st_mtime - mtime_shift))
+        written = True
+        return run()
+    finally:
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            disk = _read(abs_path)
+            if not written and disk == original:
+                if marker:
+                    try:
+                        os.remove(marker)
+                    except OSError:
+                        pass
+            elif disk != mutant:
+                side = _keep_original(original, keep_dir, abs_path)
+                what = ("no longer holds the mutant (changed by someone else during the run)" if written else
+                        "was changed by someone else while the mutant was being written (the mutant never was)")
+                _alarm(f"ALARM: {abs_path} {what}; left as "
+                       f"found, NOT restored; the original is at {side}; `git diff -- {os.path.basename(abs_path)}` "
+                       f"shows what changed")
+            else:
+                why = ""
+                try:
+                    atomic_write(abs_path, original, st.st_mode, (st.st_atime, st.st_mtime))
+                except OSError as e:
+                    why = f" ({e.__class__.__name__}: {e})"
+                if _read(abs_path) != original:
+                    side = _keep_original(original, keep_dir, abs_path)
+                    _alarm(f"COULD NOT RESTORE {abs_path}{why} — the original is at {side}; put it back by hand "
+                           f"(git checkout -- {os.path.basename(abs_path)}) before anything else")
+                elif marker:
+                    try:
+                        os.remove(marker)
+                    except OSError:
+                        pass
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+
+def lock_worktree(gdir):
+    ""
+    fd = os.open(os.path.join(gdir, "mutant-check.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def leftover_marker(worktree, marker):
+    ""
+    if not os.path.exists(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as f:
+            left = f.read().strip()
+    except OSError:
+        left = "?"
+    rel = os.path.relpath(left, worktree) if left.startswith("/") else left
+    head = git_bytes(worktree, "show", f"HEAD:{rel}")
+    if head is not None and _read(left) == head:
+        print(f"mutant-check: a previous run was interrupted while {rel} was mutated; the file matches HEAD again, "
+              f"marker {marker} cleared.")
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        return None
+    return (f"mutant-check: REFUSED — a previous run was KILLED while {rel} was mutated (marker {marker}) and the file "
+            f"still differs from HEAD: `git diff -- {rel}` shows the mutant; put it back by hand (git checkout -- {rel}), "
+            f"then delete the marker.")
+
+
+def _run_queued():
+    return SourceFileLoader("run_queued", RUN_QUEUED).load_module()
+
+
+def acquire_slot(kind):
+    ""
+    rq = _run_queued()
+    if rq.held(kind) is not None:
+        print(f"mutant-check: inside run-queued {kind}: its slot is this run's.", flush=True)
+        return None
+    return rq.acquire(kind)
+
+
+def run_py(a, worktree, sources, files, ranked, changed_paths, log, repo):
+    tests_dir = py_tests_dir(repo)
+    mutants = py_mutants(sources, files, ranked, a.max)
+    paths = sorted({p for p, _, _, _ in mutants})
+    tests = a.tests or py_tests_for(worktree, tests_dir, paths, changed_paths)
+    excluded = [t for t in tests if any(fnmatch.fnmatch(t, g) or fnmatch.fnmatch(t + ".py", g) for g in a.exclude_tests or [])]
+    tests = [t for t in tests if t not in excluded]
+    if not mutants:
+        print("mutant-check: py — no compiling mutant on the chosen lines. Nothing to prove mechanically.")
+        return 0
+    if not tests:
+        print(f"mutant-check: py — no module under {tests_dir}/ names {paths} and the branch changes no test"
+              + (f" (excluded: {excluded})" if excluded else "") + ":\n  nothing can prove these guards yet — write the test first.")
+        return 0
+    print(f"mutant-check: py — {len(mutants)} mutant(s) in {paths}; tests {tests}" + (f"; excluded {excluded}" if excluded else ""))
+    scores = {(path, lineno): (score, why) for score, path, lineno, why in ranked}
+    for path, lineno, desc, new in mutants:
+        score, why = scores[(path, lineno)]
+        print(f"  [{score:2d} {why:<14}] {path}:{lineno}  {desc}" + (f"  →  {new.strip()[:80]}" if a.dry_run else ""))
+    if a.dry_run:
+        print(f"  would run: PYTHONPATH={tests_dir} {sys.executable} -m unittest -f {' '.join(tests)}  (cwd {worktree})")
+        return 0
+    marker = os.path.join(git_dir(worktree), "mutant-check.mutating")
+    slot = None
+    try:
+        dirty = dirty_paths(worktree)
+        if dirty:
+            print("mutant-check: REFUSED — the worktree has uncommitted changes, and a mutant written over them could "
+                  "not be told from them:\n  " + "\n  ".join(dirty) + "\n  commit or stash first (13/10/2026).")
+            return 2
+        originals = {}
+        for p in paths:
+            head = git_bytes(worktree, "show", f"HEAD:{p}")
+            if head is None or head != _read(os.path.join(worktree, p)):
+                print(f"mutant-check: REFUSED — {p} on disk differs from HEAD (uncommitted, or a mutant left by an "
+                      f"interrupted run): `git diff -- {p}`; put it back first.")
+                return 2
+            originals[p] = head
+        cap, no_room = admit_run(repo, "py")
+        if no_room:
+            print(f"  not run: {no_room}: no verdict (exit 87, the memory was never there).")
+            return 0
+        slot = acquire_slot("py")
+        deadline = time.time() + a.minutes * 60
+        status, killer, base_secs = py_run_tests(worktree, tests, a.minutes * 60, log, tests_dir, repo, cap_kib=cap)
+        if status == "timeout":
+            print(f"  the tests alone exceed --minutes {a.minutes}; nothing can be proved. Raise --minutes or give --tests.")
+            return 0
+        if status == "oom":
+            print(f"  the tests alone fill the memory cap ({killer}, what all the builds here may take) before any "
+                  "mutation; nothing can be proved. Run it when more memory is free, or give --tests. Log: " + log)
+            return 0
+        if status != "green":
+            print("  the tests fail BEFORE any mutation" + (f" ({killer})" if killer else "") +
+                  ", so nothing can be proved; fix them first (a red suite at review wastes the review). Log: " + log)
+            return 0
+        per_mutant = max(30, int(base_secs * 5) + 10)
+        before = git(worktree, "status", "--porcelain")
+        old_term, old_hup = signal.signal(signal.SIGTERM, _raise_exit), signal.signal(signal.SIGHUP, _raise_exit)
+        results = []
+        try:
+            for k, (path, lineno, desc, new) in enumerate(mutants, 1):
+                if time.time() > deadline:
+                    print(f"  --minutes {a.minutes} spent after {k - 1} mutant(s); the rest is not run.")
+                    break
+                lines = originals[path].decode("utf-8").splitlines(True)
+                eol = "\n" if lines[lineno - 1].endswith("\n") else ""
+                text = "".join(lines[:lineno - 1] + [new + eol] + lines[lineno:])
+                left = max(5, min(per_mutant, int(deadline - time.time())))
+                status, killer, _ = py_mutate_and_run(os.path.join(worktree, path), originals[path], text, 2 * k,
+                                                      lambda: py_run_tests(worktree, tests, left, log, tests_dir, repo,
+                                                                           cap_kib=cap, mutant=True),
+                                                      marker=marker, keep_dir=os.path.dirname(log))
+                verdict = {"green": "SURVIVED", "red": "KILLED", "timeout": "TIMEOUT", "oom": "NO VERDICT"}[status]
+                m = Mutant(path, lineno, desc, verdict, killer if status != "oom" else "")
+                results.append(m)
+                print("  " + m.row(), flush=True)
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+            signal.signal(signal.SIGHUP, old_hup)
+        print(summarize(results).splitlines()[-1])
+        print(f"  log {log}")
+        if git(worktree, "status", "--porcelain") != before:
+            print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
+        return 0
+    finally:
+        if slot is not None:
+            os.close(slot)
+
+
+
+def repo_top(path):
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return os.path.realpath(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _hook_commands(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "command" and isinstance(v, str):
+                yield v
+            else:
+                yield from _hook_commands(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _hook_commands(v)
+
+
+def hook_paths(cmd, depth=0):
+    ""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        words = cmd.split()
+    found = set()
+    for w in words:
+        if depth == 0 and re.search(r"\s|[;&|<>()]", w):
+            found |= hook_paths(w, depth + 1)
+        parts = [w] + ([w.split("=", 1)[1]] if "=" in w else [])
+        parts += [q for p in parts for q in p.split(":")]
+        for t in parts:
+            t = os.path.expanduser(os.path.expandvars(t))
+            if t.startswith("/"):
+                found.add(os.path.realpath(t))
+            elif not t.startswith("-") and re.match(r"^[\w.+-]+$", t):
+                exe = shutil.which(t)
+                if exe:
+                    found.add(os.path.realpath(exe))
+    return found
+
+
+def protected_checkout(worktree):
+    ""
+    if repo_top(BIN) == worktree:
+        return "own bin/"
+    files = [os.path.expanduser(os.environ.get("IPHTAH_CLAUDE_SETTINGS", "~/.claude/settings.json")),
+             os.path.join(BIN, "..", "infra", "claude", "hooks.json")]
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for cmd in _hook_commands(data.get("hooks", data)):
+            for path in hook_paths(cmd):
+                if path == worktree or path.startswith(worktree + os.sep):
+                    return f"hook `{cmd}`"
+    return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mutant-check", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("worktree")
+    ap.add_argument("--base", help="the base ref (default: the repo's base from project.json, as origin/<base>)")
+    ap.add_argument("--client")
+    ap.add_argument("--max", type=int, default=10, help="mutant budget (default 10)")
+    ap.add_argument("--minutes", type=int, default=20, help="kill the run after this many minutes (default 20)")
+    ap.add_argument("--lang", choices=("java", "ts", "py"))
+    ap.add_argument("--app-dir", help="the app inside a monorepo (default: nearest package.json above the changes)")
+    ap.add_argument("--java-home")
+    ap.add_argument("--maven-args", help='extra Maven arguments, e.g. "-Pci" (default: the -P of the repo\'s build command)')
+    ap.add_argument("--tests", type=lambda s: s.split(","), help="PIT targetTests, comma-separated (default: chosen statically)")
+    ap.add_argument("--exclude-tests", type=lambda s: s.split(","), help="test globs never to run (the pom's <exclude>s are always added)")
+    ap.add_argument("--dry-run", action="store_true", help="choose and print, run nothing")
+    ap.add_argument("--keep", action="store_true", help="keep the scratch pom in the worktree (untracked) for a by-hand run")
+    a = ap.parse_args(argv)
+
+    worktree = os.path.realpath(os.path.expanduser(a.worktree))
+    if not os.path.isdir(os.path.join(worktree, ".git")) and not os.path.isfile(os.path.join(worktree, ".git")):
+        ap.error(f"{worktree} is not a git worktree")
+    why = protected_checkout(worktree)
+    if why:
+        print(f"mutant-check: REFUSED — {worktree} holds this tool's own bin/ or a checkout the Claude Code hooks run "
+              f"from ({why}); a mutant there would run inside the gates. Mutate in a separate worktree (git worktree add).")
+        return 2
+    gdir = git_dir(worktree)
+    try:
+        lock = lock_worktree(gdir)
+    except OSError as e:
+        print(f"mutant-check: REFUSED — cannot open the worktree's lock {gdir}/mutant-check.lock "
+              f"({e.__class__.__name__}: {e}); without it a second run could not be told from this one.")
+        return 2
+    if lock is None:
+        print(f"mutant-check: REFUSED — another mutant-check is running on this worktree (lock {gdir}/mutant-check.lock): "
+              "a run is in progress, its marker is left alone; two runs would mutate and restore over each other.")
+        return 2
+    try:
+        return _main_locked(a, ap, worktree, gdir)
+    finally:
+        os.close(lock)
+
+
+def _main_locked(a, ap, worktree, gdir):
+    refusal = leftover_marker(worktree, os.path.join(gdir, "mutant-check.mutating"))
+    if refusal:
+        print(refusal)
+        return 2
+    _project = SourceFileLoader("iphtah_project", os.path.join(BIN, "iphtah-project")).load_module()
+    repo = _project.repo_of(worktree, a.client) or {}
+    base = a.base or (("origin/" + repo["base"]) if repo.get("base") else None)
+    if not base:
+        ap.error("no --base and the worktree's remote is in no client's project.json")
+
+    diff = git(worktree, "diff", "--unified=0", f"{base}...HEAD")
+    all_ranges = changed_ranges(diff)
+    changed_paths = list(all_ranges)
+    source_ranges = {p: r for p, r in all_ranges.items() if is_source(p) or is_python(p, worktree)}
+    lang = a.lang or detect_lang(source_ranges, worktree)
+    if lang == "py":
+        source_ranges = {p: r for p, r in source_ranges.items() if is_python(p, worktree)}
+    elif lang:
+        ext = (".java",) if lang == "java" else tuple(e for e in SOURCE_EXT if e != ".java")
+        source_ranges = {p: r for p, r in source_ranges.items() if p.endswith(ext)}
+    if not source_ranges:
+        print(f"mutant-check: {base}...HEAD adds no source line to mutate ({len(changed_paths)} file(s) changed, "
+              "tests, locales and config only). Nothing to prove.")
+        return 0
+
+    files, sources, skipped = {}, {}, []
+    for path, rs in source_ranges.items():
+        try:
+            with open(os.path.join(worktree, path), encoding="utf-8") as fh:
+                sources[path] = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            skipped.append(f"{path} ({e.__class__.__name__})")
+            continue
+        text = sources[path].splitlines()
+        blocks = text_block_lines(sources[path]) if path.endswith(".java") else py_string_lines(sources[path]) if lang == "py" else set()
+        files[path] = [(n, text[n - 1] if n not in blocks else '"text block"') for s, e in rs for n in range(s, e + 1)
+                       if n - 1 < len(text)]
+    cfg = _project.load().get(repo.get("client")) or {} if repo.get("client") else {}
+    ranked = rank_lines(files, cfg.get("money_terms") or ())
+    chosen = select_lines(ranked, a.max) if lang != "py" else ranked
+    ranges = ranges_of(chosen)
+    if skipped:
+        print(f"mutant-check: {len(skipped)} file(s) skipped, not readable as UTF-8: {', '.join(skipped)}")
+    print(f"mutant-check: {base}...HEAD — {sum(len(v) for v in files.values())} added source line(s) in "
+          f"{len(files)} file(s); {len(ranked)} worth mutating; " +
+          (f"{len(chosen)} chosen for --max {a.max}:" if lang != "py" else f"--max {a.max} mutant(s), best lines first"))
+    for score, path, lineno, why in (chosen if lang != "py" else []):
+        print(f"  [{score:2d} {why:<14}] {path}:{lineno}  {files[path][[n for n, _ in files[path]].index(lineno)][1].strip()[:90]}")
+
+    scratch = os.path.join(CACHE, "runs", time.strftime("%Y%m%d-%H%M%S") + f"-{os.path.basename(worktree)}")
+    os.makedirs(scratch, exist_ok=True)
+    log = os.path.join(scratch, "run.log")
+    if lang == "java":
+        return run_java(a, worktree, ranges, changed_paths, scratch, log, repo)
+    if lang == "py":
+        return run_py(a, worktree, sources, files, chosen, changed_paths, log, repo)
+    return run_ts(a, worktree, ranges, scratch, log, changed_paths, repo)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

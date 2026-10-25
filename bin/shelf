@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""shelf — the work that is built but not delivered: local branches ahead of their base that GitHub does not have.
+
+    shelf --client C [--json]
+"""
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+
+
+def git(cwd, *args):
+    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def greens(state):
+    out = {}
+    path = os.path.join(state, "green-builds")
+    if os.path.exists(path):
+        for line in open(path):
+            parts = line.split()
+            if len(parts) >= 4:
+                out[parts[1]] = parts[3][:16].replace("T", " ")
+    return out
+
+
+def row_for(name, row_ids):
+    hits = [r for r in row_ids if name == r or name.startswith(r + "-")]
+    return max(hits, key=len) if hits else None
+
+
+def shelf(cfg, worktrees, green, row_ids, remote_head=None):
+    ""
+    remote_head = remote_head or (lambda cwd, b: git(cwd, "ls-remote", "--heads", "origin", b).split("\t")[0])
+    bases = {os.path.realpath(os.path.expanduser(r["path"])): (k, r.get("base", "main"))
+             for k, r in (cfg.get("repos") or {}).items() if isinstance(r, dict) and r.get("path")}
+    out = []
+    for wt in worktrees:
+        name = os.path.basename(wt.rstrip("/"))
+        if name.startswith("mc--") or name == "logs":
+            continue
+        common = git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        repo = bases.get(os.path.realpath(os.path.dirname(common))) if common else None
+        branch = git(wt, "branch", "--show-current")
+        if not repo or not branch:
+            continue
+        ahead = int(git(wt, "rev-list", "--count", f"origin/{repo[1]}..HEAD") or 0)
+        if ahead == 0:
+            continue
+        head = git(wt, "rev-parse", "HEAD")
+        remote = remote_head(wt, branch)
+        if remote == head:
+            continue
+        out.append({"worktree": name, "repo": repo[0], "branch": branch, "ahead": ahead,
+                    "green": green.get(head), "row": row_for(name, row_ids), "pushed": bool(remote)})
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(prog="shelf")
+    p.add_argument("--client", required=True)
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args()
+    cfg = json.load(open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")))
+    state = os.path.expanduser(cfg.get("state_dir") or f"~/.local/state/{a.client}")
+    wts = sorted(glob.glob(os.path.join(os.path.expanduser(cfg.get("worktrees") or "~/workspace/wt"), "*/")))
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import _map
+    mirror = _map.of(a.client, cfg, os.path.expanduser("~/.claude/iphtah-kit/clients")).path("capabilities")
+    rows = json.load(open(mirror)) if os.path.exists(mirror) else []
+    rows = rows if isinstance(rows, list) else rows.get("rows") or list(rows.values())
+    items = shelf(cfg, wts, greens(state), [r.get("id") for r in rows if r.get("id")])
+    if a.json:
+        print(json.dumps(items, ensure_ascii=False, indent=1))
+        return 0
+    for i in items:
+        g = f"green {i['green']}Z" if i["green"] else "no green record for this head"
+        r = f" → row {i['row']}" if i["row"] else " → no map row"
+        p_ = " (pushed, behind local)" if i["pushed"] else ""
+        print(f"shelf: {i['repo']} {i['branch']} [{i['worktree']}] +{i['ahead']}{p_}, {g}{r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

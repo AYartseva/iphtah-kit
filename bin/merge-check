@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# merge-check <repo> <branch> [--base B] [--keep] [--local] [--here] [--client C]
+#   builds the branch merged with its base in a throwaway worktree, as CI does, and records a green commit.
+set -euo pipefail
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+usage="usage: merge-check <repo> <branch> [--base B] [--keep] [--local] [--here] [--client C]"
+[ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }
+repo=$1
+branch=$2
+keep=; local_head=; burst=1; box_asked=; client_opt=(); base_opt=; base_label=
+args=("$@")
+shift 2
+while [ $# -gt 0 ]; do
+  case $1 in
+    --keep) keep=--keep ;;
+    --local) local_head=1 ;;
+    --here) burst= ;;
+    --client) client_opt=(--client "$2"); shift ;;
+    --base) [ $# -ge 2 ] && [ -n "$2" ] || { echo "--base needs a branch name" >&2; exit 2; }
+            base_opt=${2#origin/}; shift ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+if ! project_env=$("$here/iphtah-project" env "$repo" "${client_opt[@]}"); then
+  [ ! -d "$repo" ] || echo "merge-check: '$repo' is a folder; give the repository's name, as in the client's project.json" >&2
+  exit 2
+fi
+eval "$project_env"
+
+build_words=$(printf '%s' "$BUILD" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+case $build_words in
+  ""|true|:|"exit 0"|/bin/true|/usr/bin/true)
+    echo "RED — $repo has no real build command (« $build_words »): a no-op would record GREEN having built nothing." \
+         "Set the repository's full build in its client file (\"build\")."
+    exit 1 ;;
+esac
+
+if [ -n "$LIGHT_KIND" ] && ! "$here/run-queued" --held "$LIGHT_KIND"; then
+  if [ -n "${IPHTAH_MC_REQUEUED:-}" ]; then
+    echo "merge-check: re-entered without a $LIGHT_KIND slot held — stopping instead of looping" >&2; exit 2
+  fi
+  echo "light repository: building in a $LIGHT_KIND slot of run-queued, not behind the load" >&2
+  IPHTAH_MC_REQUEUED=1 exec "$here/run-queued" "$LIGHT_KIND" -- "$here/merge-check" "${args[@]}"
+fi
+unset IPHTAH_MC_REQUEUED
+
+stamps=$STATE/green-builds
+results=$STATE/merge-check-results
+record() { mkdir -p "$STATE"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$repo" "$branch" "${head:-?}" "$1" "${2:-0}" >> "$results"; }
+
+base=$BASE
+src=$SRC
+pr_base=$(cd "$src" && gh pr view "$branch" --json baseRefName,state \
+            -q 'select(.state=="OPEN") | .baseRefName' 2>/dev/null || true)
+base=${pr_base:-$base}
+if [ -n "$base_opt" ]; then
+  if ! open_bases=$(cd "$src" && gh pr list --head "$branch" --state open --json baseRefName,isCrossRepository \
+                      --jq '.[] | select(.isCrossRepository | not) | .baseRefName' 2>/dev/null); then
+    echo "merge-check: --base $base_opt refused — GitHub could not say whether $branch has an open PR (whose base" >&2
+    echo "  would win). Retry when it answers." >&2
+    exit 2
+  fi
+  open_bases=$(printf '%s\n' "$open_bases" | sed '/^$/d' | sort -u)
+  if [ "$(printf '%s\n' "$open_bases" | sed '/^$/d' | wc -l)" -gt 1 ]; then
+    echo "merge-check: --base $base_opt refused — $branch has open PRs on several bases: $(echo $open_bases)." >&2
+    exit 2
+  fi
+  pr_base=$open_bases
+  if [ -n "$pr_base" ] && [ "$base_opt" != "$pr_base" ]; then
+    echo "merge-check: --base $base_opt refused — $branch has an open PR on $pr_base, and CI builds it against that." >&2
+    echo "  Run without --base (or --base $pr_base); if the PR's base is wrong, retarget the PR first." >&2
+    exit 2
+  fi
+  if [ "$base_opt" = "$branch" ]; then
+    echo "merge-check: --base $base_opt refused — a branch merged with itself proves nothing." >&2; exit 2
+  fi
+  if [ "$base_opt" != "$BASE" ] && ! git -C "$src" ls-remote --exit-code -q --heads origin "refs/heads/$base_opt" >/dev/null 2>&1; then
+    echo "merge-check: --base $base_opt refused — no such branch on origin (or origin unreachable)." >&2
+    echo "  A stacked branch is checked against the branch it sits on once that branch is pushed (it went through" >&2
+    echo "  its own merge-check and review). Push the lower branch first, or check this one against $BASE." >&2
+    exit 2
+  fi
+  base=$base_opt
+  [ -n "$pr_base" ] || base_label=" (--base)"
+fi
+name=$repo--${branch//\//-}
+wt=$WT/mc--$name
+log=$WT/logs/$name.$(date +%Y%m%d-%H%M%S).log
+mkdir -p "$WT/logs"
+
+if [ -n "$local_head" ]; then
+  git -C "$src" fetch -q origin "$base"
+  head=$(git -C "$src" rev-parse --verify "refs/heads/$branch")
+else
+  git -C "$src" fetch -q origin "$branch" "$base"
+  head=$(git -C "$src" rev-parse "origin/$branch")
+fi
+keep_and_refuse() {
+  echo "worktree already exists: $wt — $1, so it is kept." >&2
+  echo "  $2" >&2
+  exit 2
+}
+remove_hint="When nothing needs it any more: git -C $src worktree remove --force $wt"
+look_hint="merge-check did not make it: look at what it holds, and remove it by hand if nothing needs it."
+mc_lock=
+nolock() { if [ -n "$mc_lock" ]; then "$@" {mc_lock}>&-; else "$@"; fi; }
+if ! command -v flock >/dev/null 2>&1; then
+  [ ! -e "$wt" ] || keep_and_refuse "without flock, merge-check cannot tell whether another run of $branch uses it" "$remove_hint"
+else
+  mkdir -p "$STATE/merge-check-locks"
+  exec {mc_lock}>"$STATE/merge-check-locks/$name.lock"
+  if ! flock -n "$mc_lock"; then
+    echo "merge-check: another merge-check of $repo:$branch is running; run this one when it has finished." >&2
+    exit 2
+  fi
+fi
+if [ -e "$wt" ]; then
+  wt_real=$(cd "$wt" 2>/dev/null && pwd -P) || keep_and_refuse "it is not a folder merge-check can enter" "$look_hint"
+  entry=$(git -C "$src" worktree list --porcelain | awk -v a="worktree $wt" -v b="worktree $wt_real" '$0 == a || $0 == b {on=1; print; next} /^worktree / {on=0} on')
+  [ -n "$entry" ] || keep_and_refuse "it is not a worktree of $src" "$look_hint"
+  ! printf '%s\n' "$entry" | grep -q '^locked' || keep_and_refuse "it is locked (git worktree lock)" \
+      "Someone locked it to keep it: when they are done, git -C $src worktree unlock $wt, then run again."
+  for p in /proc/[0-9]*; do
+    d=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case $d/ in "$wt_real"/*) keep_and_refuse "a process works inside it (pid ${p#/proc/})" \
+      "Run again when that process has left it (ps -p ${p#/proc/} -o args)." ;; esac
+  done
+  echo "replacing the worktree an earlier run of $branch left: $wt" >&2
+  git -C "$src" worktree remove --force "$wt" || keep_and_refuse "git could not remove it (above)" "$look_hint"
+fi
+git -C "$src" worktree add -q --detach "$wt" "$head"
+
+cd "$wt"
+if ! nolock git -c user.name=merge-check -c user.email=merge-check@localhost \
+     merge -q --no-edit "origin/$base" >>"$log" 2>&1; then
+  echo "CONFLICT merging origin/$base into $branch — worktree kept at $wt" | tee -a "$log"
+  record CONFLICT
+  exit 1
+fi
+
+checks=$WT/logs/$name.$(date +%Y%m%d-%H%M%S).checks
+lint_rc=0
+nolock "$here/migration-lint" "$wt" --base "origin/$base" --branch "$branch" >"$checks" 2>&1 || lint_rc=$?
+nolock "$here/save-check" "$wt" --base "origin/$base" >>"$checks" 2>&1 || echo "save-check failed (exit $?)" >>"$checks"
+nolock timeout 120 "$here/two-sources-lint" "$wt" --base "origin/$base" --client "$CLIENT" >>"$checks" 2>&1 \
+  || { rc=$?; if [ "$rc" -eq 124 ]; then echo "two-sources-lint timed out (120 s)"; else echo "two-sources-lint failed (exit $rc)"; fi >>"$checks"; }
+cat "$checks" >>"$log"
+findings=$(grep -E '^(ERROR|warn|allowed) |^(save-check|two-sources-lint) (failed|timed out)' "$checks" || true)
+[ "$lint_rc" -ge 2 ] && findings="${findings:+$findings$'\n'}migration-lint failed (exit $lint_rc): $(tail -1 "$checks")"
+rm -f "$checks"
+show_findings() { [ -z "$findings" ] || printf '%s\n' "$findings" | sed 's/^/  /'; }
+if [ "$lint_rc" -eq 1 ]; then
+  echo "RED — migration-lint: an error in the branch's migrations (worktree kept at $wt, log: $log)"
+  show_findings
+  record RED
+  exit 1
+fi
+
+if [ -n "$burst" ] && [ -z "$BURST" ]; then
+  burst=
+fi
+if [ -n "$LOCK" ] && [ -z "$burst" ]; then
+  . "$here/_build_slot.sh"
+  take_build_slot "$STATE" "$LOCK" "${LOCK_SLOTS:-1}"
+fi
+
+echo "building $repo:$branch@${head:0:8} + origin/$base${pr_base:+ (PR base)}$base_label${burst:+ remotely} in $wt (log: $log)"
+start=$(date +%s)
+if [ -n "$burst" ]; then
+  build() { $BURST "$wt"; }
+else
+  build() { bash -c "$BUILD"; }
+fi
+
+if nolock build >>"$log" 2>&1; then
+  mkdir -p "$STATE"
+  echo "$repo $head $base $(date -u +%FT%TZ)" >> "$stamps"
+  record GREEN $(( $(date +%s) - start ))
+  echo "GREEN in $(( $(date +%s) - start ))s — $repo:$branch@${head:0:8} merged with $base builds"
+  show_findings
+  if [ "$keep" != --keep ]; then
+    cd "$WT" && git -C "$src" worktree remove --force "$wt"
+  fi
+else
+  why=
+  echo "RED after $(( $(date +%s) - start ))s — ${why}worktree kept at $wt, log: $log"
+  show_findings
+  record RED $(( $(date +%s) - start ))
+  exit 1
+fi

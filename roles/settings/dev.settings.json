@@ -1,0 +1,92 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Bash(gh api *merge*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(hcloud:*)",
+      "Bash(aws:*)",
+      "Bash(gcloud:*)",
+      "Bash(az:*)",
+      "Bash(doctl:*)",
+      "Bash(gh issue close:*)",
+      "Bash(gh pr review --approve:*)",
+      "ArtifactData"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*git*push*)",
+            "command": "~/.claude/iphtah-kit/bin/push-gate",
+            "timeout": 20,
+            "statusMessage": "push-gate: checking the pushed commit against its definition of done (done.json)"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*gh *)",
+            "command": "~/.claude/iphtah-kit/bin/heavy-gate",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: posted text is not rewritten by the shell"
+          },
+          {
+            "type": "command",
+            "if": "Bash(*pkill*)",
+            "command": "~/.claude/iphtah-kit/bin/heavy-gate",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: kill by PID"
+          },
+          {
+            "type": "command",
+            "if": "Bash(*pgrep*)",
+            "command": "~/.claude/iphtah-kit/bin/heavy-gate",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: kill by PID"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "~/.claude/iphtah-kit/bin/prompt-lines --auto 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "~/.claude/iphtah-kit/bin/prompt-lines --auto --session-start 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/iphtah-kit/bin/loops stop-check 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

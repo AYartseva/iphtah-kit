@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""done-check — runs the person's own checks of their definition of done, on the commit checked out, and records each green one for push-gate.
+
+    done-check [--check NAME]...
+"""
+import argparse
+import datetime
+import os
+import signal
+import subprocess
+import sys
+
+from importlib.machinery import SourceFileLoader
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import _done
+
+_project = SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project")).load_module()
+
+DEFAULT_TIMEOUT_S = 3600
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True).stdout.strip()
+
+
+def state(top):
+    ""
+    return git(top, "rev-parse", "HEAD"), git(top, "status", "--porcelain") == ""
+
+
+def run_check(command, top, timeout):
+    ""
+    p = subprocess.Popen(["bash", "-c", command], cwd=top, start_new_session=True)
+    try:
+        code = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p)
+        return False, "timed out"
+    except BaseException:
+        _kill_group(p)
+        raise
+    return code == 0, f"exit {code}"
+
+
+def _kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    p.wait()
+
+
+class Terminated(BaseException):
+    ""
+
+
+def _on_term(signum, frame):
+    raise Terminated()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--check", action="append", default=[], help="run only this check (repeatable)")
+    a = p.parse_args()
+    top = git(os.getcwd(), "rev-parse", "--show-toplevel")
+    if not top:
+        sys.exit("done-check: not inside a git repository")
+    common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    repo = _project.where(os.path.realpath(os.path.dirname(common))) if common else None
+    if repo is None:
+        print(f"done-check: no client file names the repository at {top}", file=sys.stderr)
+        return 2
+    try:
+        checks = [c for c in _done.load() if _done.applies(c, repo["repo"])]
+        why = _done.floor_why()
+    except _done.DoneError as e:
+        print(f"done-check: {e}", file=sys.stderr)
+        return 2
+    if why is not None:
+        print(f"done-check: {_done.DONE} removes the {_done.FLOOR}: {why}")
+    unknown = sorted(set(a.check) - {c["name"] for c in checks} - {_done.FLOOR})
+    if unknown:
+        print(f"done-check: no check named {', '.join(unknown)} applies to {repo['repo']} in {_done.DONE or 'this checkout (not a kit home: no done.json read)'}",
+              file=sys.stderr)
+        return 2
+    if a.check:
+        checks = [c for c in checks if c["name"] in a.check]
+    if not checks:
+        print(f"done-check: nothing to run for {repo['repo']} beyond the {_done.FLOOR} floor "
+              f"(merge-check writes that record itself)" if why is None else
+              f"done-check: nothing to run for {repo['repo']}: {_done.DONE} lists no check for it and removes the "
+              f"{_done.FLOOR}, with its why")
+        return 0
+    sha, clean = state(top)
+    if not clean:
+        print("done-check: the tree is not clean; commit or stash first, so the record is for what was run",
+              file=sys.stderr)
+        return 2
+    red = []
+    for c in checks:
+        print(f"== {c['name']}: {c.get('why') or '(no why given)'}", flush=True)
+        try:
+            ok, why = run_check(c["run"], top, float(c.get("timeout_s") or DEFAULT_TIMEOUT_S))
+        except (OSError, ValueError, TypeError) as e:
+            ok, why = False, f"could not run ({type(e).__name__})"
+        after, still_clean = state(top)
+        if ok and (after != sha or not still_clean):
+            ok, why = False, "it changed the checkout (a new commit or modified files), so it did not check this commit"
+        if not ok:
+            print(f"RED {c['name']} ({why})", flush=True)
+            red.append(c["name"])
+            continue
+        os.makedirs(repo["state_dir"], mode=0o700, exist_ok=True)
+        when = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(os.path.join(repo["state_dir"], _done.RECORDS), "a") as f:
+            f.write(f"{repo['repo']} {sha} {c['name']} {when}\n")
+        print(f"GREEN {c['name']} {repo['repo']} {sha[:8]}", flush=True)
+    return 1 if red else 0
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _on_term)
+    try:
+        sys.exit(main())
+    except (Terminated, KeyboardInterrupt):
+        print("done-check: stopped; its running check was killed with it, nothing recorded", file=sys.stderr)
+        sys.exit(130)

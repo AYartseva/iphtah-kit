@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""two-sources-lint <repo> [--base REF] [--head REF] [--client C] [--also PATH[:REF]]… [--strict]
+"""
+import argparse
+import collections
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _pyscript import SHEBANG_BYTES, is_python_script
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ALLOW = re.compile(r"lint:\s*allow\s+((?:T\d+\s*,?\s*)+)(?!T\d)\S")
+MIN_VALUES = 3
+MAX_BYTES = int(os.environ.get("IPHTAH_TSL_MAX_BYTES", 4_000_000))
+GENERATED = re.compile(r"^\s*(?:#|//|/\*|\*|--|<!--|;)[^\n]*(?:\bGENERATED\b|(?i:do not edit))")
+HEADER_LINES = 5
+SKIP_PATH = re.compile(r"(^|/)(test|tests|__tests__|target|build|dist|node_modules|\.generated|generated|vendor|"
+                       r"coverage|\.next|out)/|\.(test|spec|stories)\.|(^|/)test_[^/]*\.py$|_test\.py$|\.d\.ts$|"
+                       r"\.min\.js$|\.(example|sample|template|dist)$|(^|/)\.[^/]+/")
+NUM = r"-?\d[\d_]*(?:\.\d+)?"
+NUM_EXPR = re.compile(r"^\s*(" + NUM + r"[LlFfDd]?)(?:\s*[*+]\s*" + NUM + r"[LlFfDd]?)*\s*$")
+
+
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.stderr.write(f"two-sources-lint: git {' '.join(args)}: {r.stderr.strip()}\n")
+        sys.exit(2)
+    return r.stdout
+
+
+def project():
+    try:
+        return SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project")).load_module()
+    except Exception:
+        return None
+
+
+def resolve_base(repo, base, client):
+    if base:
+        return base
+    p = project()
+    b = None
+    if p:
+        try:
+            b = p.base_of(repo, client)
+        except Exception:
+            b = None
+    return f"origin/{b}" if b else "origin/main"
+
+
+def sibling_repos(repo, client, also):
+    ""
+    out = []
+    for a in also or []:
+        path, _, ref = a.partition(":")
+        out.append((os.path.realpath(os.path.expanduser(path)), ref or None))
+    p = project()
+    if client and p:
+        try:
+            cfg = p.load().get(client)
+            if cfg is None:
+                raise KeyError(f"no client '{client}' under {p.CLIENTS}")
+            me = os.path.realpath(repo)
+            mine = p.repo_of(repo, client)
+            for name, r in cfg.get("repos", {}).items():
+                path = os.path.realpath(os.path.expanduser(r["path"]))
+                if path == me or (mine and mine.get("repo") == name) or not os.path.isdir(os.path.join(path, ".git")):
+                    continue
+                if not any(path == q for q, _ in out):
+                    out.append((path, f"origin/{r.get('base', 'main')}"))
+        except Exception as e:
+            sys.stderr.write(f"two-sources-lint: client {client}'s project.json could not be read ({e!r}); no siblings from it\n")
+    final = []
+    for path, ref in out:
+        if ref is None:
+            b = p.base_of(path) if p else None
+            ref = f"origin/{b}" if b else "origin/main"
+        final.append((path, ref))
+    return final
+
+
+
+
+def generated(text):
+    ""
+    return any(GENERATED.match(l) for l in text.split("\n", HEADER_LINES)[:HEADER_LINES])
+
+
+def layer_of(path, text):
+    if generated(text):
+        return None
+    low = path.lower()
+    if low.endswith(".sql"):
+        return "db"
+    if low.endswith(".java"):
+        return "java"
+    if re.search(r"\.(tsx?|jsx?|mjs|cjs)$", low):
+        return "ts"
+    if low.endswith(".py") or "." not in os.path.basename(low):
+        return "py"
+    if re.search(r"\.(ya?ml|json)$", low) and re.search(r"^(openapi|swagger)\s*:", text[:4000], re.M) \
+            or re.search(r"\.(ya?ml|json)$", low) and re.search(r'^\s*"(openapi|swagger)"\s*:', text[:4000], re.M):
+        return "contract"
+    if re.search(r"\.(ya?ml|properties|toml|env|ini|cfg)$", low) or low.endswith(".env") or "/.env" in low:
+        return "config"
+    return None
+
+
+WANTED = re.compile(r"\.(sql|java|tsx?|jsx?|mjs|cjs|py|ya?ml|json|properties|toml|env|ini|cfg)$|(^|/)\.env(\.|$)|(^|/)[^/.]+$")
+
+
+def read_tree(repo, ref, paths=None):
+    ""
+    wanted = {}
+    for line in git(repo, "ls-tree", "-r", "-l", "-z", ref).split("\0"):
+        if not line:
+            continue
+        meta, _, path = line.partition("\t")
+        if (paths is not None and path not in paths) or (paths is None and (not WANTED.search(path) or SKIP_PATH.search(path))):
+            continue
+        parts = meta.split()
+        if parts[1] != "blob":
+            continue
+        if parts[3].isdigit() and int(parts[3]) > MAX_BYTES:
+            sys.stderr.write(f"two-sources-lint: {path} skipped ({int(parts[3]) / 1e6:.1f} MB, over the {MAX_BYTES / 1e6:.0f} MB cap)\n")
+            continue
+        wanted.setdefault(parts[2], []).append(path)
+    if not wanted:
+        return {}
+    r = subprocess.run(["git", "-C", repo, "cat-file", "--batch"], input=("\n".join(wanted) + "\n").encode(),
+                       capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write(f"two-sources-lint: git cat-file in {repo}: {r.stderr.decode(errors='replace').strip()}\n")
+        sys.exit(2)
+    out, data, i = {}, r.stdout, 0
+    while i < len(data):
+        nl = data.find(b"\n", i)
+        header = data[i:nl].decode()
+        parts = header.split()
+        if len(parts) < 2:
+            break
+        if parts[1] == "missing":
+            sys.stderr.write(f"two-sources-lint: {repo}: object {parts[0][:8]} missing ({', '.join(wanted.get(parts[0], ()))}); skipped\n")
+            i = nl + 1
+            continue
+        size = int(parts[2])
+        start, i = nl + 1, nl + 1 + size + 1
+        script = is_python_script(data[start:start + min(size, SHEBANG_BYTES)])
+        blob = None
+        for path in wanted.get(parts[0], ()):
+            if "." not in os.path.basename(path) and not script:
+                continue
+            if blob is None:
+                blob = data[start:start + size].decode("utf-8", errors="replace")
+            out[path] = blob
+    return out
+
+
+def added_lines(repo, mb, head):
+    ""
+    out, lines, path = git(repo, "diff", "-U0", "-M", mb, head), collections.defaultdict(set), None
+    for line in out.splitlines():
+        if line.startswith("+++ "):
+            path = None if line == "+++ /dev/null" else re.sub(r"^\+\+\+ (b/)?", "", line).strip()
+            lines[path]
+        elif line.startswith("@@ ") and path is not None:
+            m = re.match(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
+            start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+            lines[path].update(range(start, start + count))
+    return lines
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+
+
+def norm_value(v):
+    return re.sub(r"[_\-\s]", "", v.strip().strip("'\"`").lower())
+
+
+def norm_name(n):
+    n = re.sub(r"[_\-.\s]", "", n.strip().lower())
+    n = re.sub(r"^default|default$", "", n)
+    return n
+
+
+def words(name):
+    ""
+    parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", re.sub(r"[_\-.\s]+", " ", name))
+    return [w for w in parts if w.lower() != "default"]
+
+
+def number(expr):
+    ""
+    if not NUM_EXPR.match(expr):
+        return None
+    e = re.sub(r"(?<=\d)[LlFfDd]\b", "", expr.replace("_", ""))
+    try:
+        v = eval(e, {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
+
+ListDef = collections.namedtuple("ListDef", "repo path line kind name values layer")
+NumDef = collections.namedtuple("NumDef", "repo path line name value layer")
+
+STR = r"""(?:'[^'\n]*'|"[^"\n]*"|`[^`\n]*`)"""
+STRS = STR + r"(?:\s*,\s*" + STR + r")*\s*,?"
+COMMENTS = {"java": r"//[^\n]*|/\*.*?\*/", "ts": r"//[^\n]*|/\*.*?\*/", "py": r"#[^\n]*",
+            "db": r"--[^\n]*|/\*.*?\*/", "contract": r"#[^\n]*", "config": r"#[^\n]*"}
+
+
+def mask_comments(text, layer):
+    ""
+    pat = re.compile(r"(" + STR + r")|(" + COMMENTS[layer] + r")", re.S)
+    return pat.sub(lambda m: m.group(1) if m.group(1) else re.sub(r"[^\n]", " ", m.group(2)), text)
+
+
+def strings_in(text):
+    return [s.strip("'\"`") for s in re.findall(STR, text)]
+
+
+def lists_java(text):
+    out = []
+    for m in re.finditer(r"\benum\s+(\w+)[^{;]*\{", text):
+        body_start = m.end()
+        end = body_start
+        depth = 1
+        while end < len(text) and depth:
+            c = text[end]
+            depth += (c == "{") - (c == "}")
+            end += 1
+        body = text[body_start:end - 1]
+        consts = body.split(";")[0]
+        consts = re.sub(r"\([^()]*(?:\([^()]*\)[^()]*)*\)", "", consts)
+        consts = re.sub(r"@\w+(\([^)]*\))?", " ", consts, flags=re.S)
+        names = [c.strip() for c in consts.split(",") if re.match(r"^\s*[A-Za-z_]\w*\s*(\{.*\})?\s*$", c, re.S)]
+        names = [re.sub(r"\{.*", "", n, flags=re.S).strip() for n in names]
+        if len(names) >= MIN_VALUES:
+            out.append((m.start(), "enum", m.group(1), names))
+    for m in re.finditer(r"\b(?:Set|List|EnumSet|Arrays)\s*\.\s*(?:of|asList)\s*\(\s*(" + STRS + r")\s*\)", text):
+        vals = strings_in(m.group(1))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "list", "", vals))
+    for m in re.finditer(r"(\w+)\s*(?:\[\])?\s*=\s*(?:new\s+String\s*\[\]\s*)?\{\s*(" + STRS + r")\s*\}", text):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "array", m.group(1), vals))
+    return out
+
+
+def lists_ts(text):
+    out = []
+    for m in re.finditer(r"\btype\s+(\w+)(?:<[^>]*>)?\s*=\s*\|?\s*(" + STR + r"(?:\s*\|\s*" + STR + r")*)", text):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "union", m.group(1), vals))
+    for m in re.finditer(r"\b(?:const|let|var)\s+(\w+)(?::[^=\n]+)?\s*=\s*\[\s*(" + STRS + r")\s*\]", text):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "array", m.group(1), vals))
+    for m in re.finditer(r"\benum\s+(\w+)\s*\{([^}]*)\}", text):
+        body = m.group(2)
+        vals = strings_in(body) or [c.strip() for c in body.split(",") if c.strip() and re.match(r"^\w+$", c.strip())]
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", m.group(1), vals))
+    for m in re.finditer(r"\.enum\s*\(\s*\[\s*(" + STRS + r")\s*\]", text):
+        vals = strings_in(m.group(1))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", "", vals))
+    return out
+
+
+def lists_py(text):
+    out = []
+    for m in re.finditer(r"\bLiteral\s*\[\s*(" + STRS + r")\s*\]", text):
+        vals = strings_in(m.group(1))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "literal", "", vals))
+    for m in re.finditer(r"^class\s+(\w+)\s*\([^)]*Enum[^)]*\)\s*:\s*\n((?:[ \t]+[^\n]*\n?)+)", text, re.M):
+        vals = [v.group(1) for v in re.finditer(r"^[ \t]+([A-Za-z_]\w*)\s*=\s*", m.group(2), re.M)]
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", m.group(1), vals))
+    for m in re.finditer(r"^([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*[\[({]\s*(" + STRS + r")\s*[\])}]", text, re.M):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "list", m.group(1), vals))
+    return out
+
+
+def lists_sql(text):
+    out = []
+    masked = text
+    for m in re.finditer(r"\bCHECK\s*\(\s*\(?\s*(\w+)\s*(?:::\s*\w+\s*)?IN\s*\(((?:\s*'[^']*'\s*,?)+)\)", masked, re.I):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "check", m.group(1), vals))
+    for m in re.finditer(r"\bCREATE\s+TYPE\s+([\w.\"]+)\s+AS\s+ENUM\s*\(((?:\s*'[^']*'\s*,?)+)\)", masked, re.I):
+        vals = strings_in(m.group(2))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "type", m.group(1).strip('"'), vals))
+    return out
+
+
+YAML_STRUCTURE = {"items", "schema", "type", "properties", "enum", "required", "in", "description", "default", "example",
+                  "nullable", "format", "minimum", "maximum", "minLength", "maxLength", "pattern", "allOf", "oneOf",
+                  "anyOf", "additionalProperties", "content", "application/json", "deprecated", "explode", "style",
+                  "responses", "requestBody", "parameters", "headers", "get", "post", "put", "patch", "delete",
+                  "components", "schemas", "paths", "200", "201", "202", "204", "400", "401", "403", "404", "409", "422"}
+
+
+def yaml_owner(text, pos, indent):
+    ""
+    for line in reversed(text[:pos].splitlines()):
+        m = re.match(r"^([ \t]*)(-\s*)?([A-Za-z_][\w./-]*)\s*:\s*(\S.*)?$", line)
+        if not m or len(m.group(1)) + len(m.group(2) or "") > indent:
+            continue
+        if m.group(3) == "name" and m.group(4):
+            return m.group(4).strip().strip("'\"")
+        if m.group(3) not in YAML_STRUCTURE and len(m.group(1)) < indent:
+            return m.group(3)
+    return ""
+
+
+def lists_contract(text):
+    out = []
+    for m in re.finditer(r"^([ \t]*)(?:-\s+)?enum\s*:\s*\[([^\]\n]*)\]", text, re.M):
+        vals = [v.strip() for v in m.group(2).split(",") if v.strip()]
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", yaml_owner(text, m.start(), len(m.group(1))), [v.strip("'\"") for v in vals]))
+    for m in re.finditer(r"^([ \t]*)(?:-\s+)?enum\s*:\s*\n((?:\1[ \t]+-\s+[^\n]*\n?)+)", text, re.M):
+        vals = [v.strip().strip("'\"") for v in re.findall(r"^[ \t]+-\s+([^\n#]*)", m.group(2), re.M)]
+        vals = [v for v in vals if v]
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", yaml_owner(text, m.start(), len(m.group(1))), vals))
+    for m in re.finditer(r'"enum"\s*:\s*\[((?:\s*"[^"\n]*"\s*,?)+)\]', text):
+        vals = strings_in(m.group(1))
+        if len(vals) >= MIN_VALUES:
+            out.append((m.start(), "enum", "", vals))
+    return out
+
+
+LISTS = {"java": lists_java, "ts": lists_ts, "py": lists_py, "db": lists_sql, "contract": lists_contract}
+
+
+def list_defs(repo, path, text, layer):
+    f = LISTS.get(layer)
+    if not f:
+        return []
+    out = []
+    for pos, kind, name, values in f(mask_comments(text, layer)):
+        key = frozenset(norm_value(v) for v in values)
+        if len(key) < MIN_VALUES:
+            continue
+        out.append(ListDef(repo, path, line_of(text, pos), kind, name, key, layer))
+    return out
+
+
+
+UPPER = r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z][A-Z0-9_]{3,}"
+
+
+def nums_java(text):
+    for m in re.finditer(r"\bstatic\s+final\s+(?:int|long|short|byte|double|float|Integer|Long|Short|Double|Float|BigDecimal)"
+                         r"\s+(" + UPPER + r")\s*=\s*([^;]+);", text):
+        v = number(m.group(2))
+        if v is not None:
+            yield m.start(), m.group(1), v
+
+
+def nums_ts(text):
+    for m in re.finditer(r"\b(?:const|let|var)\s+(" + UPPER + r")(?::\s*\w+)?\s*=\s*([^;\n]+?)\s*(?:;|$|\s+as\s+const)", text, re.M):
+        v = number(m.group(2))
+        if v is not None:
+            yield m.start(), m.group(1), v
+
+
+def nums_py(text):
+    for m in re.finditer(r"^(" + UPPER + r")(?::\s*\w+)?\s*=\s*([^#\n]+)", text, re.M):
+        v = number(m.group(2))
+        if v is not None:
+            yield m.start(), m.group(1), v
+
+
+def nums_config(text):
+    for m in re.finditer(r"^[ \t]*-?\s*([A-Za-z][\w.\-]*)\s*[:=]\s*(" + NUM + r")\s*(?:#.*)?$", text, re.M):
+        name = m.group(1).split(".")[-1]
+        if len(norm_name(name)) >= 3:
+            yield m.start(), name, number(m.group(2))
+
+
+NUMS = {"java": nums_java, "ts": nums_ts, "py": nums_py, "config": nums_config}
+
+
+def num_defs(repo, path, text, layer):
+    f = NUMS.get(layer)
+    if not f:
+        return []
+    return [NumDef(repo, path, line_of(text, pos), name, value, layer) for pos, name, value in f(mask_comments(text, layer))
+            if len(words(name)) >= 2]
+
+
+
+RECORD_ORDER = ["contract", "db", "java", "py", "config", "ts"]
+NUMBER_ORDER = ["contract", "db", "config", "java", "py", "ts"]
+RECORD_WHY = {"contract": "the contract: the code is generated from it, or reads it",
+              "db": "the stored values: the store refuses what the code forgets",
+              "java": "the back end: the front copies it", "py": "the back end: the front copies it",
+              "config": "the config: a constant beside a config key is the key's shadow",
+              "ts": "the front"}
+TIE_WHY = "the place that was there first"
+
+
+def record_of(added, others, order=RECORD_ORDER):
+    ""
+    rank = lambda d: order.index(d.layer) if d.layer in order else 99
+    best = min(rank(d) for d in [added] + others)
+    rec = next(d for d in others + [added] if rank(d) == best)
+    tie = rank(added) == best and rec is not added
+    return rec, (TIE_WHY if tie else RECORD_WHY.get(rec.layer, rec.layer))
+
+
+MAX_PLACES = 4
+
+
+def places(items, repo, fmt):
+    shown = [fmt(o) for o in items[:MAX_PLACES]]
+    more = len(items) - len(shown)
+    return ", ".join(shown) + (f" and {more} more place(s)" if more > 0 else "")
+
+
+def where(d, repo):
+    rel = os.path.relpath(d.repo, repo) if d.repo != repo else ""
+    label = f"{os.path.basename(d.repo)}:" if rel else ""
+    return f"{label}{d.path}:{d.line}"
+
+
+def allowed(text, line, rule):
+    lines = text.splitlines()
+    for ln in (line, line - 1):
+        if 1 <= ln <= len(lines):
+            m = ALLOW.search(lines[ln - 1])
+            if m and rule in re.findall(r"T\d+", m.group(1)):
+                return True
+    return False
+
+
+def run(repo, base, head="HEAD", siblings=()):
+    repo = os.path.realpath(repo)
+    mb = git(repo, "merge-base", base, head).strip()
+    changed = [l.split("\t")[-1] for l in git(repo, "diff", "--name-status", "-M", mb, head).splitlines()
+               if l and l[0] in "AMRC"]
+    changed = [p for p in changed if WANTED.search(p) and not SKIP_PATH.search(p)]
+    files = read_tree(repo, head)
+    changed = [p for p in changed if p in files and layer_of(p, files[p])]
+    trees = {repo: files}
+    for path, ref in siblings:
+        if subprocess.run(["git", "-C", path, "rev-parse", "--verify", "-q", ref], capture_output=True).returncode:
+            sys.stderr.write(f"two-sources-lint: {path} has no {ref}; skipped\n")
+            continue
+        trees[path] = read_tree(path, ref)
+    lists, nums = [], []
+    for r, tree in trees.items():
+        for path, text in tree.items():
+            layer = layer_of(path, text)
+            if not layer:
+                continue
+            lists += list_defs(r, path, text, layer)
+            nums += num_defs(r, path, text, layer)
+    by_values = collections.defaultdict(list)
+    for d in lists:
+        by_values[d.values].append(d)
+    by_name = collections.defaultdict(list)
+    for d in nums:
+        by_name[norm_name(d.name)].append(d)
+
+    findings, seen = [], set()
+    added = added_lines(repo, mb, head)
+    for path in changed:
+        text = files.get(path)
+        if text is None:
+            continue
+        layer = layer_of(path, text)
+        if not layer:
+            continue
+        touched = added.get(path, set())
+        front_copies = []
+        for d in list_defs(repo, path, text, layer):
+            if d.line not in touched or d.values in seen or allowed(text, d.line, "T1"):
+                continue
+            others = [o for o in by_values[d.values] if o.layer != d.layer and (o.repo, o.path) != (d.repo, d.path)]
+            if not others:
+                continue
+            seen.add(d.values)
+            rec, why = record_of(d, others)
+            if d.layer == "ts" and rec.layer == "contract":
+                front_copies.append((d, rec))
+                continue
+            what = f"{d.kind} {d.name}".strip()
+            findings.append(f"T1 {where(d, repo)} — the {len(d.values)} values of {what} are also "
+                            f"{places(others, repo, lambda o: f'{o.kind} {o.name} at {where(o, repo)}'.replace('  ', ' '))}; "
+                            f"system of record: {where(rec, repo)} ({why}); the other place should "
+                            f"read or derive from it, or say why not (lint: allow T1 <reason>)")
+        if front_copies:
+            what = places(front_copies, repo, lambda dr: f"{dr[0].name or dr[0].kind} (:{dr[0].line}, enum {dr[1].name} at {where(dr[1], repo)})")
+            findings.append(f"T1 {path} — {len(front_copies)} hand-written cop{'y' if len(front_copies) == 1 else 'ies'} of "
+                            f"contract enums: {what} — generating the types from openapi.yaml would remove them; "
+                            f"system of record: the contract (lint: allow T1 <reason> on each to keep them)")
+        for d in num_defs(repo, path, text, layer):
+            if d.line not in touched or allowed(text, d.line, "T2"):
+                continue
+            key = norm_name(d.name)
+            others = [o for o in by_name[key] if (o.repo, o.path) != (d.repo, d.path) and
+                      (o.value == d.value or (o.layer != d.layer and "config" in (o.layer, d.layer)))]
+            if not others:
+                continue
+            fact = (key, frozenset(o.value for o in by_name[key]))
+            if fact in seen:
+                continue
+            seen.add(fact)
+            rec, why = record_of(d, others, NUMBER_ORDER)
+            drift = [o for o in others if o.value != d.value]
+            if drift:
+                state = "DRIFT: " + places(drift, repo, lambda o: f"{o.name} = {o.value} at {where(o, repo)}")
+                if len(drift) < len(others):
+                    state += "; same value at " + places([o for o in others if o not in drift], repo, lambda o: where(o, repo))
+            else:
+                state = "a copy of " + places(others, repo, lambda o: f"{o.name} = {o.value} at {where(o, repo)}")
+            findings.append(f"T2 {where(d, repo)} — {d.name} = {d.value} is {state}; system of record: "
+                            f"{where(rec, repo)} ({why}); read it from there, or say why not "
+                            f"(lint: allow T2 <reason>)")
+    return findings, len(changed)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repo")
+    ap.add_argument("--base", help="base ref (default: origin/<base branch> from project.json, or origin/main)")
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--client")
+    ap.add_argument("--also", action="append", metavar="PATH[:REF]",
+                    help="a sibling repository whose definitions count as another layer (repeatable)")
+    ap.add_argument("--strict", action="store_true", help="exit 1 when there are findings")
+    a = ap.parse_args()
+    repo = os.path.realpath(os.path.expanduser(a.repo))
+    base = resolve_base(repo, a.base, a.client)
+    siblings = sibling_repos(repo, a.client, a.also)
+    findings, files = run(repo, base, a.head, siblings)
+    for f in findings:
+        print(f"warn    {f}")
+    extra = f", with {len(siblings)} sibling repo(s)" if siblings else ""
+    print(f"two-sources-lint: {files} changed source file(s) against {base}{extra}: {len(findings)} finding(s)")
+    return 1 if a.strict and findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

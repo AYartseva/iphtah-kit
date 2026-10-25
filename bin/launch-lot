@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""launch-lot — one gesture at a lot's launch: the ledger entry, the related issues, and a brief skeleton to complete.
+
+    launch-lot --client C <lot-id> --title "…" --class XS|S|M|L|XL --type kind/layer/domain
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import string
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _purpose
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+CLASSES = ["XS", "S", "M", "L", "XL"]
+ALLOWED = ("lots", "open-issues")
+BIG = ("L", "XL")
+EXIT_UNSPLIT = 3
+
+
+def _queue_tick():
+    if not os.path.isfile(os.path.join(HERE, "queue-tick")):
+        return None
+    loader = importlib.machinery.SourceFileLoader("queue_tick", os.path.join(HERE, "queue-tick"))
+    qt = importlib.util.module_from_spec(importlib.util.spec_from_loader("queue_tick", loader))
+    loader.exec_module(qt)
+    return qt
+
+
+def delivery_target(cls, client):
+    ""
+    import datetime as dt
+    qt = _queue_tick()
+    if qt is None:
+        return None
+    now = os.environ.get("IPHTAH_NOW")
+    now = dt.datetime.fromisoformat(now.replace("Z", "+00:00")) if now else dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    return qt.delivery_target(now, qt.p90_hours(cls, client)).isoformat(timespec="minutes")
+
+
+WIDE_MODULES = 3
+
+
+def hcw():
+    ""
+    path = os.path.join(ROOT, "docs", "research", "human-context-window", "hcw.py")
+    loader = importlib.machinery.SourceFileLoader("hcw", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("hcw", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+PATH_TOKEN = re.compile(r"[A-Za-z0-9_.@*-]+(?:/[A-Za-z0-9_.@*-]+)+")
+
+
+def is_path(tok):
+    ""
+    parts = tok.strip("/").split("/")
+    if len(parts) < 2 or any(x.isdigit() for x in parts):
+        return False
+    return len(parts) >= 3 or bool(re.search(r"\.[A-Za-z]{1,5}$", parts[-1]))
+
+
+def width(modules, repos_named, row, all_repos):
+    ""
+    mods = set(modules)
+    repos = set(repos_named)
+    scout = (row or {}).get("scout") if isinstance((row or {}).get("scout"), dict) else {}
+    module_of = hcw().module_of
+    for text in scout.get("goesWhere") or []:
+        text = str(text)
+        for name, r in all_repos.items():
+            words = {name, (r.get("github") or "").split("/")[-1]} - {""}
+            if any(re.search(r"(?<![\w-])" + re.escape(w) + r"(?![\w-])", text) for w in words):
+                repos.add(name)
+        for tok in PATH_TOKEN.findall(text):
+            if is_path(tok):
+                mods.add(module_of(tok.strip("/")))
+    reasons = []
+    if len(mods) >= WIDE_MODULES:
+        reasons.append(f"{len(mods)} modules ({', '.join(sorted(mods))})")
+    if len(repos) >= 2:
+        reasons.append(f"both repositories ({', '.join(sorted(repos))})")
+        if scout.get("contract"):
+            reasons.append("a contract with its two sides")
+    return mods, repos, reasons
+
+
+def run(tool, args):
+    if tool not in ALLOWED:
+        sys.exit(f"launch-lot: refused to run {tool!r}: launch-lot only runs {', '.join(ALLOWED)}")
+    p = subprocess.run([os.path.join(HERE, tool)] + args, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"launch-lot: {tool} failed:\n{p.stdout[-800:]}{p.stderr[-800:]}")
+    return p.stdout.strip()
+
+
+CELL_ARGS = re.compile(r"--model ([\w.-]+) --effort ([a-z]+)(?: --protocol ([AB]))?(.*)$", re.M)
+MONEY_LINE = re.compile(r"^money/rights lots: ([\w.-]+) · ([a-z]+) \(add --money\),?\s*(.*)$", re.M)
+
+
+def model_cell(client, cls, type_, money):
+    ""
+    try:
+        p = subprocess.run([os.path.join(HERE, "lots"), "--client", client, "cell", "--class", cls, "--type", type_],
+                           capture_output=True, text=True, timeout=120)
+        m = (MONEY_LINE if money else CELL_ARGS).search(p.stdout) if p.returncode == 0 else None
+        if not m:
+            why = (p.stderr or p.stdout).strip().splitlines()[-1:] or [f"exit {p.returncode}"]
+            raise RuntimeError(why[0][:200])
+    except Exception as e:
+        return None, None, None, (f"Agent model: unknown (lots cell failed: {e}); choose it with "
+                                  f"`lots --client {client} cell --class {cls}`")
+    if money:
+        model, effort, tail = m.groups()
+        protocol, what = None, "lots cell, money/rights"
+    else:
+        model, effort, protocol, tail = m.groups()
+        what = "lots cell" + (f", protocol {protocol}" if protocol else "")
+    tail = tail.strip().lstrip(";").strip()
+    return model, effort, protocol, f"Agent model: {model} · effort {effort} ({what})" + (f"; {tail}" if tail else "")
+
+
+def scratch_root():
+    return os.environ.get("CLAUDE_SCRATCHPAD") or os.path.expanduser("~/.local/state/iphtah-kit/scratch")
+
+
+def _project():
+    loader = importlib.machinery.SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("iphtah_project", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+PROJECT = _project()
+queue_kind = PROJECT.queue_kind
+
+
+def build_lines(client, repos, only):
+    out = []
+    for name, r in repos.items():
+        if only and name not in only:
+            continue
+        kind = queue_kind(r)
+        out.append(f"- {name} ({r.get('github', 'no GitHub name')}, base {r.get('base', '?')}):")
+        if kind:
+            out.append(f"  - targeted tests only: ~/.claude/iphtah-kit/bin/run-queued {kind} -- <the tests you touched>")
+        else:
+            out.append("  - targeted tests only (this repository has no run-queued kind): <the tests you touched>")
+        out.append(f"  - full build: {PROJECT.full_build_line(client, name, r)}")
+        if r.get("build"):
+            out.append(f"    (merge-check runs: {r['build']}; never run that yourself)")
+    return "\n".join(out) if out else "- <no repository matched: name the build by hand>"
+
+
+def map_block(row):
+    if not row:
+        return ""
+    lines = [f"\n## The map row « {row.get('name', row['id'])} » ({row['id']}, area {row.get('area', '?')}, "
+             f"state {row.get('state', '?')})"]
+    if row.get("desc"):
+        lines.append(row["desc"].strip())
+    qs = row.get("questions") or []
+    answered = [q for q in qs if (q.get("answer") or "").strip()]
+    open_ = [q for q in qs if not (q.get("answer") or "").strip()]
+    if answered:
+        lines.append("Answered questions:")
+        lines += [f"- {q['q']} → {q['answer'].strip()}" for q in answered]
+    if open_:
+        lines.append("Still OPEN (do not guess; stop and ask):")
+        lines += [f"- {q['q']}" for q in open_]
+    if row.get("links"):
+        lines.append("Links:")
+        lines += [f"- {l.get('label', '')}: {l.get('url', '')}" for l in row["links"]]
+    return "\n".join(lines) + "\n"
+
+
+def _loops():
+    loader = importlib.machinery.SourceFileLoader("loops_for_launch_lot", os.path.join(HERE, "loops"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def close_launch_loop(state, rows, lot):
+    ""
+    try:
+        lp = _loops()
+        said = []
+
+        def closing(lines):
+            for row in sorted(r for r in rows if r):
+                key = lp.launch_key(row)
+                if not any(l.startswith("- [ ]") and key in l for l in lines):
+                    continue
+                try:
+                    lines = lp.close(lines, key, f"launched as lot {lot} (launch-lot)")
+                    said.append(f"loop closed: {key} launched as lot {lot}")
+                except SystemExit as e:
+                    said.append(f"loop not closed: {e}")
+            return lines if said else None
+        lp.edit(os.path.join(state, "open-loops.md"), closing)
+        return said
+    except Exception as e:
+        return [f"loop not closed ({e.__class__.__name__}: {e}); queue-tick closes it at its next tick"]
+
+
+def find_row(m, row_id):
+    ""
+    path = m.path("capabilities")
+    if not os.path.exists(path):
+        sys.exit(f"launch-lot: no map {'rows' if m.files else 'mirror'} at {m.where()}; nothing done")
+    rows = m.load("capabilities")
+    hit = next((r for r in rows if r.get("id") == row_id or r.get("lotId") == row_id), None)
+    if not hit:
+        sys.exit(f"launch-lot: no map row {row_id!r} in {path}; nothing done")
+    return hit
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--client", required=True)
+    ap.add_argument("lot")
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--class", dest="cls", choices=CLASSES, required=True)
+    ap.add_argument("--type", required=True, help="kind/layer/domain, from the closed taxonomy in bin/lots")
+    ap.add_argument("--map-row")
+    ap.add_argument("--money", action="store_true", help="moves money or rights: opus · high, its own agent type")
+    ap.add_argument("--repo", action="append", default=[], help="the repositories the lot touches (default: all)")
+    ap.add_argument("--module", action="append", default=[],
+                    help="a module the brief names (first two directory levels); 3 or more make the lot wide")
+    ap.add_argument("--unsplit-reason", default="",
+                    help="required for --class L or XL, or a wide lot: why this lot is launched whole instead of split")
+    a = ap.parse_args(argv)
+    clients = os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
+    pj = json.load(open(os.path.join(clients, a.client, "project.json")))
+    state = os.path.expanduser(pj.get("state_dir") or f"~/.local/state/{a.client}")
+    unknown = [r for r in a.repo if r not in (pj.get("repos") or {})]
+    if unknown:
+        sys.exit(f"launch-lot: {', '.join(unknown)} not a repository of client {a.client}; nothing done")
+
+    import _map
+    row = find_row(_map.of(a.client, pj, clients), a.map_row) if a.map_row else None
+    qt = _queue_tick()
+    repo = qt.queue_repo(pj) if qt else None
+    if repo and not a.map_row and not qt.issue_refs(a.title, repo):
+        print(f"launch-lot: WARNING — the title names no issue of {repo} and there is no --map-row: queue-tick will "
+              f"keep proposing the issue this lot builds. Put « #N » in --title or give --map-row {repo}#N.",
+              file=sys.stderr)
+    _, _, wide = width(a.module, a.repo, row, pj.get("repos") or {})
+    if wide:
+        print(f"launch-lot: WARNING — a wide lot: {'; '.join(wide)}. Width, not length, carries the risk (how "
+              f"many modules a lot spans predicts its trouble better than its size): treated as L for the splitter.",
+              file=sys.stderr)
+    if (a.cls in BIG or wide) and not a.unsplit_reason.strip():
+        what = f"class {a.cls}" if a.cls in BIG else "a wide lot (treated as L)"
+        print(f"launch-lot: refused, nothing written — {what} is launched only when it cannot be split. Split it into "
+              f"2 to 4 pieces of size S or M, each useful and testable on its own, and launch each; or give "
+              f"--unsplit-reason \"<why it cannot be cut>\" (two small lots finish in time more often than one big "
+              f"one)", file=sys.stderr)
+        return EXIT_UNSPLIT
+
+    model, effort, protocol, agent_line = model_cell(a.client, a.cls, a.type, a.money)
+    add = ["--client", a.client, "add", a.lot, "--title", a.title, "--class", a.cls, "--type", a.type]
+    if model:
+        add += ["--model", model, "--effort", effort] + (["--protocol", protocol] if protocol else [])
+    if a.map_row:
+        add += ["--map-row", a.map_row]
+    if a.money:
+        add.append("--money")
+    if os.environ.get("IPHTAH_NOW"):
+        add += ["--started", os.environ["IPHTAH_NOW"]]
+    target = delivery_target(a.cls, a.client)
+    if target:
+        add += ["--delivery-target", target]
+    issues_out = run("open-issues", ["--client", a.client])
+    ledger = run("lots", add)
+    closed = close_launch_loop(state, {a.map_row, a.lot} | (qt.issue_refs(a.title, repo) if repo else set()), a.lot)
+    issues = issues_out.rsplit("→", 1)[-1].strip() if "→" in issues_out else os.path.join(state, "open-issues.txt")
+
+    _purpose.ensure_template(a.lot)
+    tpl = string.Template(open(os.path.join(ROOT, "templates", "lot-brief.txt"), encoding="utf-8").read())
+    money = ("This lot moves money or rights: the money-rights-builder agent type (opus · high), and the rights "
+             "review before merge.\n") if a.money else ""
+    print(f"# launch-lot: {ledger.splitlines()[-1] if ledger else 'ledger entry written'}")
+    print(f"# open issues: {issues_out.splitlines()[-1] if issues_out else issues}")
+    for line in closed:
+        print(f"# {line}")
+    print("# Brief skeleton (complete each « <the session writes …> », then launch the agent yourself):\n")
+    unsplit = (f"Launched whole although class {a.cls}, because: {a.unsplit_reason.strip()}\n"
+               if a.cls in BIG else
+               f"Launched whole although wide ({'; '.join(wide)}), because: {a.unsplit_reason.strip()}\n"
+               if wide else "")
+    print(tpl.substitute(lot=a.lot, title=a.title, cls=a.cls, type=a.type, money=agent_line + "\n" + money + unsplit, map=map_block(row),
+                         issues=issues, rules=os.path.join(ROOT, "rituals", "brief-and-review-rules.md"),
+                         scratch=os.path.join(scratch_root(), a.lot),
+                         purpose=os.path.join(_purpose.lot_dir(a.lot), "purpose.md"),
+                         build=build_lines(a.client, pj.get("repos") or {}, a.repo)).rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

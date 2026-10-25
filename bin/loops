@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""loops [--client C] list|add|append|close|acts|due — the open loops file, edited by command instead of by hand.
+
+    loops list [--grep K] [--all]
+    loops add "YYYY-MM-DD HH:MM" "who" "what" --acts A
+    loops append K "text"
+    loops close K ["note"] [--dropped "reason"]
+    loops acts K A
+    loops due [--now T]    the promises due now, listed
+    loops stop-check       the Stop hook: a promise of future work needs a loop
+"""
+import argparse
+import contextlib
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from zoneinfo import ZoneInfo
+
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _zone import home_zone
+PARIS = home_zone()[1]
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+CLIENTS = os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
+ACTS = ("vela", "owner")
+ACTS_HELP = "--acts vela | owner | other:<slug> (who does the action; « who » is for whom; slug = a-z, 0-9, -)"
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+LINE = re.compile(r"^- \[(?P<mark>[ x])\]\s*(?P<when>\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)?\s*(?:·\s*)?"
+                  r"(?:acts:(?P<acts>\S+)\s*·\s*(?:made:(?P<made>\d{4}-\d{2}-\d{2}T\d{2}:\d{2})\s*·\s*)?)?(?P<rest>.*)$")
+STAMP = re.compile(r"→ (?P<kind>DONE|DROPPED) (?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}|\d{2}/\d{2} \d{2}:\d{2})"
+                   r"(?::[ ]?(?P<note>.*))?$")
+
+
+def path_of(client, clients=None):
+    ""
+    clients = clients or os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
+    pj = os.path.join(clients, client, "project.json")
+    state = json.load(open(pj)).get("state_dir") if os.path.exists(pj) else None
+    return os.path.join(os.path.expanduser(state or f"~/.local/state/{client}"), "open-loops.md")
+
+
+def read(path):
+    return open(path, encoding="utf-8").read().split("\n") if os.path.exists(path) else []
+
+
+def write(path, lines):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+@contextlib.contextmanager
+def locked(path):
+    ""
+    import fcntl
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def edit(path, fn):
+    ""
+    with locked(path):
+        new = fn(read(path))
+        if new is not None:
+            write(path, new)
+        return new
+
+
+def one_open(lines, key):
+    hits = [i for i, l in enumerate(lines) if l.startswith("- [ ]") and key in l]
+    if len(hits) != 1:
+        cands = "; ".join(lines[i][6:80] for i in hits[:5]) or "none"
+        raise SystemExit(f"loops: « {key} » matches {len(hits)} open lines ({cands}); be more specific")
+    return hits[0]
+
+
+def slug(name):
+    ""
+    plain = "".join(c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
+
+
+def check_acts(acts):
+    ""
+    if acts is None:
+        raise SystemExit(f"loops: who acts is missing: {ACTS_HELP}")
+    if acts in ACTS:
+        return acts
+    name = acts[len("other:"):] if acts.startswith("other:") else ""
+    if name and SLUG.fullmatch(name):
+        return acts
+    hint = f"; write other:{slug(name)}" if name and slug(name) else ""
+    raise SystemExit(f"loops: « {acts} » is not a who-acts value; {ACTS_HELP}{hint}")
+
+
+def parse(line):
+    ""
+    m = LINE.match(line)
+    return m.groupdict() if m else None
+
+
+def closing(line):
+    ""
+    for m in re.finditer(r"→ (?:DONE|DROPPED) ", line):
+        s = STAMP.match(line, m.start())
+        if s:
+            return {"kind": s["kind"], "stamp": s["stamp"], "note": (s["note"] or "").strip()}
+    return None
+
+
+def with_acts(line, acts, replace=False):
+    ""
+    p = parse(line)
+    if p is None:
+        raise SystemExit(f"loops: not a promise line (`- [ ]` or `- [x]`), left as it is: {line[:60]}")
+    if p["acts"] and not replace:
+        raise SystemExit(f"loops: line already says acts:{p['acts']}: {line[:60]}")
+    head = f"- [{p['mark']}] " + (f"{p['when']} · " if p["when"] else "")
+    made = f"made:{p['made']} · " if p["made"] else ""
+    return f"{head}acts:{check_acts(acts)} · {made}{p['rest']}"
+
+
+def one_line(lines, key):
+    ""
+    hits = [i for i, l in enumerate(lines) if l.startswith("- [") and key in l]
+    if len(hits) != 1:
+        cands = "; ".join(lines[i][6:80] for i in hits[:5]) or "none"
+        raise SystemExit(f"loops: « {key} » matches {len(hits)} lines ({cands}); be more specific")
+    return hits[0]
+
+
+def set_acts(lines, key, acts):
+    lines = list(lines)
+    i = one_line(lines, key)
+    lines[i] = with_acts(lines[i], acts, replace=True)
+    return lines
+
+
+def add(lines, when, who, what, acts, now=None):
+    ""
+    dt.datetime.strptime(when, "%Y-%m-%d %H:%M")
+    made = (now or dt.datetime.now(PARIS)).strftime("%Y-%m-%dT%H:%M")
+    new = f"- [ ] {when} · acts:{check_acts(acts)} · made:{made} · {who} · {what}"
+    at = next((i for i, l in enumerate(lines) if l.startswith("- [")), len(lines))
+    return lines[:at] + [new] + lines[at:]
+
+
+def key_of(lines, key):
+    ""
+    i = one_open(lines, key)
+    p = parse(lines[i])
+    if not p["made"]:
+        raise SystemExit(f"loops: no key: the line has no made: stamp (written before 12/10/2026): {lines[i][6:80]}")
+    return p["made"]
+
+
+def append(lines, key, text):
+    i = one_open(lines, key)
+    lines = list(lines)
+    lines[i] = lines[i].rstrip() + " " + text
+    return lines
+
+
+def close(lines, key, note="", now=None, dropped=None):
+    ""
+    i = one_open(lines, key)
+    if dropped is not None and not dropped.strip():
+        raise SystemExit("loops: --dropped needs the reason it was not done (`loops close K --dropped \"why\"`)")
+    if dropped is not None and note:
+        raise SystemExit("loops: a dropped promise takes one text, its reason: put the note in --dropped")
+    stamp = (now or dt.datetime.now(PARIS)).strftime("%Y-%m-%d %H:%M")
+    verdict = f" → DROPPED {stamp}: {dropped.strip()}" if dropped is not None else f" → DONE {stamp}" + (f": {note}" if note else "")
+    lines = list(lines)
+    lines[i] = "- [x]" + lines[i][5:].rstrip() + verdict
+    return lines
+
+
+PROMISE = re.compile(r"\b(?:while you(?:'re| are)? (?:rest|sleep|away|busy|out)|pendant que (?:tu|vous))\b"
+                     r"|\b(?:I'll|I’ll|I will|I'm going to|I’m going to) (?:do|prepare|draft|build|write|send|check|look|sort|get|have|work|"
+                     r"fix|finish|run|read|review|make|come back|follow up)\b"
+                     r"|\bje (?:vais|ferai|reviens|m'en occupe)\b", re.I)
+DATED = re.compile(r"loops (?:add|append)\b")
+CONDITIONAL = re.compile(r"\b(?:if|once|when|and|reply|answer|say|si|quand|dès que|et)\b[^.!?\n]{0,40}$", re.I)
+
+
+def promise_in(text):
+    ""
+    for m in PROMISE.finditer(text):
+        if not CONDITIONAL.search(text[max(0, m.start() - 60):m.start()]):
+            return m
+    return None
+
+
+def due(lines, now, seen):
+    ""
+    out = []
+    for l in lines:
+        p = parse(l)
+        if not p or p["mark"] != " " or p["acts"] != "vela" or not p["when"]:
+            continue
+        when = p["when"] if len(p["when"]) > 10 else p["when"] + " 00:00"
+        if when > now:
+            continue
+        key = when + " " + p["rest"].split(" + ")[0][:120]
+        if key not in seen:
+            out.append((key, l))
+    return out
+
+
+def turn_of(rows):
+    ""
+    start = 0
+    for i, r in enumerate(rows):
+        m = r.get("message") or {}
+        c = m.get("content")
+        if r.get("type") == "user" and not r.get("isMeta") and not r.get("isSidechain") and (isinstance(c, str) or any(
+                isinstance(x, dict) and x.get("type") == "text" for x in c or [])):
+            start = i
+    text, calls = "", []
+    for r in rows[start:]:
+        m = r.get("message") or {}
+        if r.get("type") != "assistant" or r.get("isSidechain") or m.get("role") != "assistant":
+            continue
+        for x in m.get("content") or []:
+            if isinstance(x, dict) and x.get("type") == "text":
+                text = x["text"]
+            elif isinstance(x, dict) and x.get("type") == "tool_use":
+                calls.append(json.dumps(x.get("input", {}), ensure_ascii=False) + " " + x.get("name", ""))
+    return text, calls
+
+
+def stop_verdict(hook):
+    ""
+    if hook.get("stop_hook_active"):
+        return None
+    try:
+        rows = [json.loads(l) for l in open(hook["transcript_path"], encoding="utf-8") if l.strip()]
+    except (OSError, KeyError, ValueError):
+        return None
+    text, calls = turn_of(rows)
+    m = promise_in(text)
+    if not m or any(DATED.search(c) or "ScheduleWakeup" in c or "CronCreate" in c for c in calls):
+        return None
+    return (f"Your last message promises later work (« {m.group(0)} ») and this turn dated nothing. Do it now, or "
+            "date it with `~/.claude/iphtah-kit/bin/loops add` (or append to its loop), or, if a loop already holds it, "
+            "say which in one line. Then end the turn.")
+
+
+def default_client():
+    ""
+    c = os.environ.get("IPHTAH_CLIENT")
+    if not c:
+        try:
+            c = open(os.path.expanduser("~/.claude/iphtah-kit/default-client")).read().strip()
+        except OSError:
+            c = None
+    if not c:
+        only = glob.glob(os.path.join(os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients")),
+                                      "*", "project.json"))
+        c = os.path.basename(os.path.dirname(only[0])) if len(only) == 1 else None
+    return c
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--client", default=default_client())
+    ap.add_argument("--file")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    ls = sub.add_parser("list"); ls.add_argument("--grep", default=""); ls.add_argument("--all", action="store_true")
+    ad = sub.add_parser("add"); ad.add_argument("when"); ad.add_argument("who"); ad.add_argument("what")
+    ad.add_argument("--acts", help="vela | owner | other:<slug>: who does the action (required)")
+    ap_ = sub.add_parser("append"); ap_.add_argument("key"); ap_.add_argument("text")
+    cl = sub.add_parser("close"); cl.add_argument("key"); cl.add_argument("note", nargs="?", default="")
+    cl.add_argument("--dropped", metavar="REASON", help="closed without doing it, and why")
+    ac = sub.add_parser("acts"); ac.add_argument("key"); ac.add_argument("acts")
+    ky = sub.add_parser("key"); ky.add_argument("key")
+    du = sub.add_parser("due"); du.add_argument("--wake", metavar="SESSION"); du.add_argument("--now")
+    du.add_argument("--wa", help=argparse.SUPPRESS)
+    sub.add_parser("stop-check")
+    a = ap.parse_args(argv)
+    if a.cmd == "stop-check":
+        try:
+            hook = json.load(sys.stdin)
+        except ValueError:
+            return 0
+        reason = stop_verdict(hook) if isinstance(hook, dict) else None
+        if reason:
+            print(json.dumps({"decision": "block", "reason": reason}))
+        return 0
+    if not a.file and not a.client:
+        sys.exit("loops: no client to read: pass --client C (or --file F), or set IPHTAH_CLIENT")
+    path = a.file or path_of(a.client)
+    lines = read(path)
+    if a.cmd == "list":
+        for n, l in enumerate(lines, 1):
+            if (l.startswith("- [ ]") or a.all and l.startswith("- [x]")) and a.grep in l:
+                print(f"{n}: {l[:160]}")
+        return 0
+    if a.cmd == "key":
+        print(key_of(lines, a.key))
+        return 0
+    if a.cmd == "due":
+        return cmd_due(path, lines, a)
+    with locked(path):
+        lines = read(path)
+        new = mutate(lines, a)
+        if new is None:
+            return 0
+        write(path, new)
+    print(f"loops: {a.cmd} done ({path.replace(os.path.expanduser('~'), '~')})")
+    return 0
+
+
+def mutate(lines, a):
+    ""
+    if a.cmd == "add":
+        return add(lines, a.when, a.who, a.what, a.acts)
+    if a.cmd == "acts":
+        return set_acts(lines, a.key, a.acts)
+    if a.cmd == "append":
+        return append(lines, a.key, a.text)
+    return close(lines, a.key, a.note, dropped=a.dropped)
+
+
+def save_seen(path, seen):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(seen[-500:], f)
+    os.replace(tmp, path)
+
+
+def cmd_due(path, lines, a):
+    if a.wake or a.wa:
+        print("loops: --wake and --wa are not in this kit (no timers, no channel); listing what is due")
+    now = a.now or dt.datetime.now(PARIS).strftime("%Y-%m-%d %H:%M")
+    for key, line in due(lines, now, set()):
+        print(f"due ({key[:16]}): {what_of(line)[:160]}")
+    return 0
+
+
+def what_of(line):
+    ""
+    return parse(line)["rest"].split(" · ", 1)[-1]
+
+
+LAUNCH_LINE = re.compile(r"^LAUNCH (\S+):")
+
+
+def launch_key(row):
+    ""
+    return f"LAUNCH {row}:"
+
+
+MIRROR_LINE = re.compile(r"^MIRROR (\S+):")
+
+
+def mirror_key(client):
+    ""
+    return f"MIRROR {client}:"
+
+
+BUILT_LINE = re.compile(r"^BUILT (\S+):")
+
+
+def built_key(row):
+    ""
+    return f"BUILT {row}:"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

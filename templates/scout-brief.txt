@@ -1,0 +1,78 @@
+LOT: scout-$row_id
+Scout the product map row « $name » ($row_id) — READ ONLY
+
+## Why
+Before a row is qualified or launched, someone reads what already exists (08/10/2026). Work was launched
+on a row whose goal was already met in production, a new thing was proposed where an existing one fitted, and a lot
+was started in an area owned by someone else. « We are not paid to be smart, we are paid to create value. »
+Your job is to find what exists, not to design or build.
+$row
+
+## Where to look
+$repos
+- Open issues of these repositories, one per line: $issues
+  Read the whole list (titles do not use the row's words); name each related issue and its relation.
+- The map's other rows are in $mirror (JSON): a neighbouring row may already cover this one.
+
+## Area owners (the session's manager is $me)
+$owners
+
+## Rules
+- READ ONLY: no edit, no commit, no build, no test run, no install. No network except `gh` reads
+  (`gh issue view`, `gh pr list`, `gh pr view`, `gh search`). Never post, push or message anyone.
+- Cite file:line (or the route) for every entry of « exists ». Never answer « nothing exists » without having
+  searched: put what you searched (the greps, the folders, the issue words) in « searched ».
+- Built work may sit on local branches GitHub never saw: before « nothing exists », run
+  `~/.claude/iphtah-kit/bin/shelf --client $client` and `git branch --list '*<row word>*'` in each repo for the row's
+  words; a match there is « live »: branch.
+- « live »: prod when the base branch carries it and it is deployed (say how you know; if unsure, merged);
+  merged = on the base branch; branch = only on a branch or an open PR; no = written nowhere yet.
+- Reuse before you write (rules file, rule 0b: $rules): list in « reuses » the tables, routes, components, rights
+  and tools the work should build on.
+- « touches »: every area of the table above that the work would change; « touchesOthers »: those whose owner is not
+  $me.
+- « verdict »: already-done when the row's goal is met (then say where); needs-discussion when it touches someone
+  else's area or contradicts an issue; needs-spec when the row cannot be built as written; else ready.
+- When « touchesOthers » is not empty, consider a SPLIT: our part, launchable now, and their part, to discuss with
+  them. Propose one (verdict « split » and a « split » object) ONLY when the cut falls on a CONTRACT, a stable
+  boundary such as an API field or a published file, and our half is useful and testable on its own with no change
+  on their side. Otherwise do not split: use needs-discussion and say in « summary » why the row cannot be split.
+  « split.theirs » names one of « touchesOthers » (same area and owner). The session checks a split before it is
+  written; nothing is split automatically.
+- SIZE SPLIT: when you size the work L or XL, you MUST also propose a « sizeSplit »: 2 to 4 pieces of
+  size S or M, each written as what its user can do, the first one being the thinnest action a user can see (something a user
+  can see exists within days, not at the end). Cut each piece on a stable boundary (a contract, a published
+  file, a screen, a data kind), never in the middle of one; each piece useful and testable on its own (it can be merged and checked before the next starts);
+  give their order with « after » (empty, or the name of an EARLIER piece). Big lots end beyond their forecast more
+  often: each unknown dimension multiplies the space a lot must cover, and two small lots finish in time more often
+  than one big. If the work truly cannot be cut, give no « sizeSplit » and say why in « summary ». No « sizeSplit »
+  for XS, S or M. It may coexist with an area « split ».
+- RULE QUESTIONS (pre-build review, 16/10/2026): list in « ruleQuestions » at most 3 questions whose answer would
+  change what gets built, and only of two kinds: a real gap or ambiguity in the spec, or a yes needed on money,
+  rights, words of outside people or an irreversible deletion. Each with its decider, what it changes and your
+  recommendation. A question you would simply answer with your recommendation is not one: decide it, say « decided:
+  X, because Y » in « summary », and put its useful follow-ups in « blockers » as issues to open (16/10/2026: « a
+  question that doesn't really need me starts with "My recommendation" »). Omit the key when there is none.
+- Stay under about 15 minutes. When time runs out, answer with what you have and say so in « blockers ».
+- Scratch files, if any, only under $scratch/.
+
+## Answer
+End your reply with exactly one fenced ```json block of this shape (no other key; « searched » is required when
+« exists » is empty; « split » only with the verdict « split »; « sizeSplit » only with size L or XL; « ruleQuestions » only when there are some):
+```json
+{"exists": [{"what": "…", "where": "file:line or route", "live": "prod|merged|branch|no"}],
+ "searched": ["what you searched, when exists is empty or partial"],
+ "goesWhere": ["files, tables, routes"], "reuses": ["existing things to reuse"],
+ "touches": ["areas"], "touchesOthers": [{"area": "…", "owner": "…"}],
+ "contract": false, "migration": false, "size": "XS|S|M|L|XL",
+ "blockers": ["…"], "relatedIssues": [{"ref": "owner/repo#n", "relation": "closes|advances|touches|contradicts"}],
+ "verdict": "ready|already-done|needs-discussion|needs-spec|split", "summary": "two lines",
+ "split": {"contract": "the boundary, one sentence", "whyOursStandsAlone": "one sentence",
+           "ours": {"name": "…", "desc": "…", "goesWhere": ["…"], "size": "XS|S|M|L|XL"},
+           "theirs": {"area": "…", "owner": "…", "name": "…", "desc": "…", "question": "what to ask them"}},
+ "ruleQuestions": [{"question": "…", "changes": "what the answer changes in the build", "recommendation": "…", "owner": "…"}],
+ "sizeSplit": {"why": "the boundaries, one sentence",
+               "pieces": [{"name": "…", "desc": "…", "goesWhere": ["…"], "size": "S|M", "after": ""},
+                          {"name": "…", "desc": "…", "goesWhere": ["…"], "size": "S|M", "after": "<an earlier piece's name>"}]}}
+```
+The session reads it, then records it on the map row, or quotes it in the lot's brief.

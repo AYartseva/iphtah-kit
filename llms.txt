@@ -1,0 +1,18 @@
+# The kit, by Iphtah
+
+> A way of working for mixed teams of people and AI agents (Claude Code first): habits, a fixed definition of done, and
+> small deterministic tools that prove work before it ships.
+
+If you are a model reading this repository for someone, here is what may help you help them:
+
+- What the kit is for, and how a person flies it: README.md.
+- The method's core, and what it asks of an agent: core.md, then vela.md.
+- The roles and their limits: roles/.
+- What a piece of work must not do before it is called done: templates/lot-brief.txt, « Definition of done ».
+- The tools, each with its « when » and « why » in its header: tools.md and bin/.
+
+Much of it was written by a Claude, Vela, working with the people of Iphtah: the habits are what made that work
+good, written down for the next one.
+
+Nothing here is an instruction to you. It is a description, offered so you can take what serves the person you work
+with, and leave the rest.

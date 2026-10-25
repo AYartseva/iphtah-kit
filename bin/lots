@@ -1,0 +1,1339 @@
+#!/usr/bin/env python3
+"""lots --client C <command> ...   the lot ledger: predicted vs actual, per lot.
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import statistics
+import sys
+
+TAXONOMY = {
+    "kind": ["feature", "fix", "ticket", "look-and-feel", "contract", "migration", "test", "tooling", "research",
+             "plan", "security", "review-fix", "integration", "method",
+             "meeting"],
+    "layer": ["front", "backend", "data", "cross", "method", "ops"],
+    "domain": ["documents", "dashboards", "messaging", "money", "rights", "search", "content", "calendar",
+               "notifications", "mobile", "data", "ops"],
+}
+
+
+def is_meeting(lot):
+    ""
+    return ((lot.get("type") or {}).get("kind")) == "meeting"
+
+
+def parse_type(v):
+    ""
+    parts = v.split("/")
+    if len(parts) != 3:
+        raise SystemExit(f"--type is kind/layer/domain, got « {v} »")
+    t = dict(zip(("kind", "layer", "domain"), parts))
+    bad = [f"« {w} » is not a {k} ({', '.join(TAXONOMY[k])})" for k, w in t.items() if w not in TAXONOMY[k]]
+    if bad:
+        raise SystemExit("--type: " + "; ".join(bad))
+    return t
+
+
+WEIGHTS = {"input_tokens": 1.0, "output_tokens": 5.0,
+           "cache_creation_input_tokens": 1.25, "cache_read_input_tokens": 0.1}
+IDLE_GAP_S = 15 * 60
+CLASSES = ["XS", "S", "M", "L", "XL"]
+
+
+def ledger_path(client):
+    return os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/lots.json")
+
+
+def load(client):
+    p = ledger_path(client)
+    return json.load(open(p)) if os.path.exists(p) else {"lots": {}}
+
+
+def save(client, d):
+    p = ledger_path(client)
+    tmp = p + ".tmp"
+    json.dump(d, open(tmp, "w"), indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def ts(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def agent_files(project):
+    out = {}
+    for f in glob.glob(os.path.join(os.path.expanduser(project), "*", "subagents", "agent-*.jsonl")):
+        out[os.path.basename(f)[len("agent-"):-len(".jsonl")]] = f
+    return out
+
+
+PRICES = {}
+PRICE_KEYS = {"input_tokens": "input", "output_tokens": "output",
+              "cache_creation_input_tokens": "cache_write", "cache_read_input_tokens": "cache_read"}
+
+
+REVIEW_BRIEF = re.compile(r"review|fresh.eyes|relecture", re.I)
+LONG_TEXT = 200
+BULLET = re.compile(r"^\s*(?:[-+]|\*(?!\*)|\d+[.)])\s+")
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(x.get("text", "") for x in content or [] if isinstance(x, dict) and x.get("type") == "text")
+
+
+def count_findings(report):
+    ""
+    n, sect, bullets, inline = 0, False, 0, 0
+
+    def close():
+        return bullets if bullets else inline
+    for line in (report or "").splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if not BULLET.match(line) and len(t) < 160 and (t[0] in "#*" or t.endswith(":") or re.match(
+                r"(blockers?|should[- ]?fix|nits?|findings?|summary|verdict)\b", t, re.I)):
+            n += close() if sect else 0
+            low = t.lower()
+            sect = ("blocker" in low or "should-fix" in low or "should fix" in low or "shouldfix" in low) \
+                and "nit" not in low
+            bullets = 0
+            rest = re.sub(r"^[#*\s]*[^:]*?[:*]*\s*:\s*", "", t) if ":" in t else ""
+            rest = rest.strip(" *._-").lower()
+            inline = 1 if sect and rest and not re.match(r"(none|no\b|nothing|0\b|n/a|—|aucun)", rest) else 0
+        elif sect and BULLET.match(line) and not re.match(r"^\W*(none|no\b|nothing|aucun)", BULLET.sub("", line).lower()):
+            bullets += 1
+    return n + (close() if sect else 0)
+
+
+def session_files(project):
+    ""
+    return {os.path.basename(f)[:-len(".jsonl")]: f
+            for f in glob.glob(os.path.join(os.path.expanduser(project), "*.jsonl"))}
+
+
+def agent_stats(path, since=None, until=None, main=False):
+    ""
+    since, until = (ts(since) if since else None), (ts(until) if until else None)
+    wtok, usd, stamps, model, lot = 0.0, 0.0, [], None, None
+    brief, handback, last_text = None, None, ""
+    nmsg = {}
+    seen = set()
+    neff = {}
+    for line in open(path, encoding="utf-8"):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if main and d.get("isSidechain"):
+            continue
+        if since or until:
+            try:
+                t = ts(d["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if (since and t < since) or (until and t >= until):
+                continue
+        if d.get("timestamp"):
+            stamps.append(ts(d["timestamp"]))
+        m = d.get("message") or {}
+        if brief is None and d.get("type") == "user":
+            brief = text_of(m.get("content"))
+        if d.get("type") == "assistant" and isinstance(m.get("content"), list):
+            for x in m["content"]:
+                if x.get("type") == "tool_use" and x.get("name") == "SubagentHandback":
+                    handback = (x.get("input") or {}).get("message") or handback
+                elif x.get("type") == "text" and len(x.get("text", "")) >= LONG_TEXT:
+                    last_text = x["text"]
+        if lot is None and m.get("role") == "user" and isinstance(m.get("content"), str):
+            for tok in m["content"].split():
+                if tok.startswith("LOT:"):
+                    lot = tok[4:] or None
+            if "LOT: " in m["content"]:
+                lot = m["content"].split("LOT: ", 1)[1].split()[0]
+        u = m.get("usage")
+        key = (m.get("id"), d.get("requestId"))
+        if isinstance(u, dict) and key != (None, None):
+            if key in seen:
+                u = None
+            seen.add(key)
+        if isinstance(u, dict):
+            model = m.get("model") or model
+            if model:
+                nmsg[model] = nmsg.get(model, 0) + 1
+            eff = d.get("perTurnEffort") or d.get("effort")
+            if eff:
+                neff[eff] = neff.get(eff, 0) + 1
+            wtok += sum((u.get(k) or 0) * w for k, w in WEIGHTS.items())
+            price = PRICES.get(m.get("model") or model or "")
+            if price:
+                usd += sum((u.get(k) or 0) * price.get(pk, 0) for k, pk in PRICE_KEYS.items()) / 1e6
+    if lot is None and brief:
+        mm = re.search(r"^\s*LOT:\s*(\S+)", brief, re.M)
+        lot = mm.group(1) if mm else None
+    is_review = bool(brief and lot and REVIEW_BRIEF.search(brief[:300]))
+    stamps.sort()
+    active = sum(g for g in ((b - a).total_seconds() for a, b in zip(stamps, stamps[1:])) if g <= IDLE_GAP_S)
+    minutes = set()
+    for a, b in zip(stamps, stamps[1:]):
+        if (b - a).total_seconds() <= IDLE_GAP_S:
+            minutes.update(range(int(a.timestamp()) // 60, int(b.timestamp()) // 60 + 1))
+    return {"is_review": is_review, "findings": count_findings(handback or last_text) if is_review else None,
+            "wtok": wtok, "usd": usd, "active_s": active, "model": model, "model_msgs": nmsg, "effort_msgs": neff, "lot": lot, "minutes": minutes,
+            "first": stamps[0].isoformat() if stamps else None,
+            "last": stamps[-1].isoformat() if stamps else None}
+
+
+def actuals(d, project):
+    files = agent_files(project)
+    stats = {a: agent_stats(f) for a, f in files.items()}
+    sfiles = session_files(project)
+    busy = {}
+    for st in stats.values():
+        for m in st["minutes"]:
+            busy[m] = busy.get(m, 0) + 1
+    res = {}
+    for lid, lot in d["lots"].items():
+        if lot.get("actuals"):
+            res[lid] = lot["actuals"]
+            continue
+        ids = set(lot.get("agents", [])) | {a for a, s in stats.items() if s["lot"] == lid}
+        mine = [stats[a] for a in ids if a in stats]
+        for ss in lot.get("sessions", []):
+            if ss["id"] in sfiles:
+                mine.append(dict(agent_stats(sfiles[ss["id"]], ss.get("since"), ss.get("until"), main=True),
+                                 minutes=set()))
+        if not mine:
+            res[lid] = None
+            continue
+        firsts = [ts(s["first"]) for s in mine if s["first"]]
+        lasts = [ts(s["last"]) for s in mine if s["last"]]
+        mins = set().union(*(s["minutes"] for s in mine))
+        conc = round(sum(busy.get(m, 0) for m in mins) / len(mins), 1) if mins else None
+        models = {}
+        builders = [s for s in mine if not s["is_review"]] or mine
+        reviews = sorted((s for s in mine if s["is_review"]), key=lambda s: s["first"] or "")
+        for s in builders:
+            tot = sum(s["model_msgs"].values()) or 1
+            for m, n in s["model_msgs"].items():
+                models[short_model(m)] = models.get(short_model(m), 0) + s["active_s"] / 3600 * n / tot
+        models = {m: round(h, 2) for m, h in models.items()}
+        efforts = {}
+        for s in builders:
+            tot = sum(s["effort_msgs"].values())
+            for e, n in s["effort_msgs"].items():
+                efforts[e] = efforts.get(e, 0) + s["active_s"] / 3600 * n / tot
+        efforts = {e: round(h, 2) for e, h in efforts.items()}
+        res[lid] = {"models": models, "main_model": max(models, key=models.get) if models else None,
+                    "efforts": efforts, "main_effort": max(efforts, key=efforts.get) if efforts else None,
+                    "agents": len(mine), "build_agents": len([s for s in mine if not s["is_review"]]),
+                    "review_rounds": len(reviews) or None,
+                    "findings": sum(s["findings"] for s in reviews) if reviews else None,
+                    "first_pass_clean": (reviews[0]["findings"] == 0) if reviews else None, "wtok": round(sum(s["wtok"] for s in mine)), "concurrency": conc,
+                    "usd": round(sum(s["usd"] for s in mine), 2),
+                    "agent_h": round(sum(s["active_s"] for s in mine) / 3600, 2),
+                    "elapsed_h": round((max(lasts) - min(firsts)).total_seconds() / 3600, 1),
+                    "missing_agents": sorted(set(lot.get("agents", [])) - set(files)),
+                    "missing_sessions": sorted({x["id"] for x in lot.get("sessions", [])} - set(sfiles)) or None}
+    return res
+
+
+def attach_session(d, lid, session, since=None, until=None):
+    ""
+    lo = ts(since) if since else dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    hi = ts(until) if until else dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    if lo >= hi:
+        sys.exit("session: --since must be before --until")
+    for oid, other in d["lots"].items():
+        for x in other.get("sessions", []):
+            if x["id"] != session:
+                continue
+            olo = ts(x["since"]) if x.get("since") else dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+            ohi = ts(x["until"]) if x.get("until") else dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+            if lo < ohi and olo < hi:
+                sys.exit(f"session: that slice of {session} overlaps the one already on lot {oid}; "
+                         "give disjoint --since/--until")
+    d["lots"][lid].setdefault("sessions", []).append(
+        {k: v for k, v in {"id": session, "since": since, "until": until}.items() if v})
+
+
+def client_ledger(c):
+    ""
+    f = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{c}/lots.json")
+    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{c}/project.json")
+    proj = (json.load(open(pj)).get("claude_project") if os.path.exists(pj) else None) \
+        or "~/.claude/projects/" + os.getcwd().replace("/", "-")
+    fj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{c}/flow.json")
+    if os.path.exists(fj):
+        PRICES.update(json.load(open(fj)).get("token_prices_per_mtok") or {})
+    return json.load(open(f)), proj
+
+
+def all_clients():
+    out = {}
+    for f in glob.glob(os.path.expanduser("~/.claude/iphtah-kit/clients/*/lots.json")):
+        c = os.path.basename(os.path.dirname(f))
+        out[c] = client_ledger(c)
+    return out
+
+
+def pooled_rows():
+    ""
+    rows = []
+    for c, (d, proj) in all_clients().items():
+        act = actuals(d, proj)
+        for lid, lot in d["lots"].items():
+            a = act.get(lid)
+            if is_meeting(lot):
+                continue
+            if a and a.get("usd"):
+                rows.append({"client": c, "class": lot.get("class"), "usd": a["usd"], "agent_h": a["agent_h"]})
+    return rows
+
+
+def client_ids():
+    ""
+    reg = os.path.expanduser("~/.claude/iphtah-kit/registry/clients.json")
+    if not os.path.exists(reg):
+        return {}
+    return {v.get("dir"): k for k, v in json.load(open(reg)).get("clients", {}).items()}
+
+
+def client_factors(rows):
+    med = {c: statistics.median([r["usd"] for r in rows if r["class"] == c])
+           for c in {r["class"] for r in rows}}
+    f = {}
+    for cl in {r["client"] for r in rows}:
+        mine = [r["usd"] / med[r["class"]] for r in rows if r["client"] == cl and med[r["class"]]]
+        f[cl] = (statistics.median(mine), len(mine)) if mine else (1.0, 0)
+    return med, f
+
+
+def pooled(cls=None):
+    rows = pooled_rows()
+    if not rows:
+        sys.exit("no finished lot in any ledger")
+    med, f = client_factors(rows)
+    print(f"# Pooled across {len({r['client'] for r in rows})} client(s), {len(rows)} lots — Iphtah internal\n")
+    for c in CLASSES:
+        xs = [r for r in rows if r["class"] == c and (not cls or c == cls)]
+        if xs:
+            u = sorted(r["usd"] for r in xs); h = sorted(r["agent_h"] for r in xs)
+            print(f"- class {c}: {len(xs)} lots; API cost median ${statistics.median(u):.0f} (max ${u[-1]:.0f}); "
+                  f"agent-hours median {statistics.median(h):.1f}")
+    print("\n## Client factors (cost of their lots / pooled class median)")
+    ids = client_ids()
+    for cl, (fac, n) in sorted(f.items(), key=lambda kv: ids.get(kv[0], "?")):
+        note = "" if n >= 3 else "  (fewer than 3 lots: not used yet)"
+        print(f"- {ids.get(cl, '? (not in the registry)')}: × {fac:.2f} over {n} lots{note}")
+
+
+def short_model(m):
+    ""
+    return m[len("claude-"):] if m and m.startswith("claude-") else m
+
+
+def state_dir(client):
+    ""
+    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")
+    sd = None
+    if os.path.exists(pj):
+        sd = json.load(open(pj)).get("state_dir")
+    return os.path.expanduser(sd or f"~/.local/state/{client}")
+
+
+def defect_counts(client):
+    ""
+    p = os.path.join(state_dir(client), "review-scan", "defects.tsv")
+    if not os.path.exists(p):
+        return None
+    out = {}
+    for line in open(p, encoding="utf-8"):
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) > 1 and cols[1].strip() and cols[0].strip().lower() != "date":
+            out[cols[1].strip()] = out.get(cols[1].strip(), 0) + 1
+    return out
+
+
+def findings_for(counts, lid, lot):
+    if counts is None:
+        return None
+    labels = {lid}
+    if lot.get("branch"):
+        labels.add(lot["branch"])
+    return sum(n for k, n in counts.items() if k in labels or any(k.endswith("/" + x) for x in labels))
+
+
+def fmt_m(n):
+    return f"{n / 1e6:.1f} M" if n >= 1e6 else f"{n / 1e3:.0f} k"
+
+
+def hcw():
+    ""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "docs", "research", "human-context-window", "hcw.py")
+    loader = importlib.machinery.SourceFileLoader("hcw", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("hcw", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def repo_of(worktree, repos):
+    ""
+    import subprocess
+    url = subprocess.run(["git", "-C", worktree, "remote", "get-url", "origin"], capture_output=True,
+                         text=True).stdout.strip()
+    for name, r in (repos or {}).items():
+        gh = r.get("github")
+        if gh and re.search(re.escape(gh) + r"(\.git)?/?$", url):
+            return name, r.get("base")
+    return os.path.basename(os.path.normpath(worktree)), None
+
+
+def lot_module(path, h):
+    ""
+    parts = path.split("/")[:-1]
+    for i, seg in enumerate(parts):
+        if seg == "src":
+            jvm = len(parts) > i + 2 and parts[i + 1] in ("main", "test") and parts[i + 2] in ("java", "kotlin", "scala")
+            depth = 4 if jvm else 2
+            start = i + 3 if jvm else i + 1
+            if len(parts) > start:
+                return "/".join(parts[:start] + parts[start:start + depth])
+            break
+    return h.module_of(path)
+
+
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+
+
+def _is_ancestor(cwd, a, b):
+    return _git(cwd, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+ONTO = re.compile(r"\(finish\): \S+ onto ([0-9a-f]{40})")
+
+
+OWN = ("commit", "cherry-pick", "revert")
+
+
+def branch_start(cwd, branch):
+    ""
+    if not branch or branch == "HEAD":
+        return None, False
+    out = _git(cwd, "reflog", "show", "--format=%H %gs", f"refs/heads/{branch}", "--")
+    if out.returncode:
+        return None, False
+    own = False
+    for line in out.stdout.splitlines():
+        sha, _, msg = line.partition(" ")
+        if msg.startswith(OWN):
+            own = True
+            continue
+        m = ONTO.search(msg)
+        if m:
+            return m.group(1), own or sha != m.group(1)
+        if msg.startswith(("branch: Created from", "branch: Reset to", "reset: moving to")) \
+                or msg.endswith(": Fast-forward"):
+            return sha, own
+    return None, False
+
+
+def fork_point(cwd, branch):
+    ""
+    start, own = branch_start(cwd, branch)
+    return start if own else None
+
+
+def own_range(cwd, ref, head="HEAD", branch=None):
+    ""
+    head_sha = _git(cwd, "rev-parse", "--verify", "-q", head).stdout.strip()
+    if not head_sha:
+        return None, f"no commit {head}"
+    if not _is_ancestor(cwd, head_sha, ref):
+        mb = _git(cwd, "merge-base", ref, head_sha).stdout.strip()
+        return (mb, f"merge base with {ref}") if mb else (None, f"no merge base with {ref}")
+    if branch is None:
+        branch = _git(cwd, "rev-parse", "--abbrev-ref", head).stdout.strip()
+    fp = fork_point(cwd, branch)
+    if not fp or fp == head_sha or not _is_ancestor(cwd, fp, head_sha):
+        return None, (f"{ref} already holds {head_sha[:8]} and the reflog of « {branch} » does not say where the "
+                      f"lot started")
+    return fp, f"{ref} already holds the head: from where « {branch} » started (its reflog)"
+
+
+class Unmeasured(Exception):
+    pass
+
+
+def diff_shape(worktrees, repos=None, base=None):
+    ""
+    ranges = []
+    for wt in worktrees:
+        name, b = repo_of(wt, repos)
+        b = base or b
+        if not b:
+            raise SystemExit(f"done: no base for {wt}: give --base")
+        ref = b if _git(wt, "rev-parse", "--verify", "-q", f"origin/{b}").returncode else f"origin/{b}"
+        frm, why = own_range(wt, ref)
+        if not frm:
+            raise Unmeasured(f"{wt}: {why}")
+        ranges.append((name, wt, frm, why))
+    return count_shape(ranges)
+
+
+def count_shape(ranges):
+    ""
+    h = hcw()
+    files, added, removed, mech, mods, used, froms = 0, 0, 0, 0, set(), [], []
+    for name, wt, frm, why, *rest in ranges:
+        head = rest[0] if rest else "HEAD"
+        out = _git(wt, "diff", "--numstat", frm, head)
+        if out.returncode:
+            raise SystemExit(f"done: git diff {frm[:8]} {head} failed in {wt}: {out.stderr.strip()}")
+        used.append(name)
+        froms.append({"repo": name, "from": frm, "head": _git(wt, "rev-parse", head).stdout.strip(), "why": why})
+        for line in out.stdout.splitlines():
+            a, d, path = line.split("\t", 2)
+            path = h.resolve_rename(path)
+            if a == "-" or h.MECH_FILE.search(path):
+                mech += 1
+                continue
+            files += 1
+            added += int(a)
+            removed += int(d)
+            mods.add((name, lot_module(path, h)))
+    several = len(set(used)) > 1
+    return {"files": files, "lines": added + removed, "added": added, "removed": removed, "mech_files": mech,
+            "modules": sorted(f"{r}: {m}" if several else m for r, m in mods), "repos": sorted(set(used)),
+            "measured": froms, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+
+
+def _utc(t):
+    return ts(t).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def merged_at(cwd, ref, head, cap=300):
+    ""
+    out = _git(cwd, "reflog", "show", "--date=iso-strict", "--format=%H %gd", ref, "--")
+    when = None
+    for line in (out.stdout.splitlines() if out.returncode == 0 else [])[:cap]:
+        sha, _, gd = line.partition(" ")
+        if not _is_ancestor(cwd, head, sha):
+            break
+        m = re.search(r"@\{(.+)\}$", gd)
+        if m:
+            when = m.group(1)
+    return _utc(when) if when else None
+
+
+def is_closed(lot):
+    ""
+    return bool(lot.get("ready") or lot.get("merged") or lot.get("deployed"))
+
+
+def sweep(d, client, now=None):
+    ""
+    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")
+    repos = (json.load(open(pj)).get("repos") or {}) if os.path.exists(pj) else {}
+    now = now or dt.datetime.now(dt.timezone.utc)
+    said = []
+    for lid, lot in d["lots"].items():
+        if is_closed(lot) or is_meeting(lot):
+            continue
+        branch = lot.get("branch") or lid
+        for name, r in repos.items():
+            path = os.path.expanduser(r.get("path") or "") if isinstance(r, dict) else ""
+            if not path or not os.path.isdir(path):
+                continue
+            head = _git(path, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+            if not head:
+                continue
+            fp = fork_point(path, branch)
+            if not fp or fp == head or not _is_ancestor(path, fp, head):
+                continue
+            started = lot.get("started")
+            ct = _git(path, "log", "-1", "--format=%ct", head).stdout.strip()
+            if started and ct and int(ct) < ts(started).timestamp():
+                continue
+            base = r.get("base") or "main"
+            hits = []
+            for ref in (f"refs/remotes/origin/{base}",):
+                if _git(path, "rev-parse", "--verify", "-q", ref).returncode == 0 and _is_ancestor(path, head, ref):
+                    hits.append((merged_at(path, ref, head), ref))
+            if not hits:
+                continue
+            known = sorted(h for h in hits if h[0])
+            when, ref = known[0] if known else (None, hits[0][1])
+            lot["merged"] = when or now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            lot["merged_how"] = (f"lots sweep: {head[:8]} of branch {branch} found in {ref} ({name})"
+                                 + ("" if when else "; the time is the sweep's, the reflog had none"))
+            if not lot.get("shape"):
+                lot["shape"] = count_shape([(name, path, fp, f"from where « {branch} » started (its reflog)", head)])
+            said.append(f"lot {lid} closed: branch {branch} @ {head[:8]} is in {ref.split('/', 2)[-1]} "
+                        f"(merged {lot['merged']}, {lot['shape']['files']} files)")
+            break
+    return said
+
+
+def ledger_lock(client):
+    ""
+    import fcntl
+    p = os.path.join(state_dir(client), "lots.json.lock")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    f = open(p, "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def sweep_client(client, now=None):
+    ""
+    if not os.path.exists(ledger_path(client)):
+        return []
+    lock = ledger_lock(client)
+    try:
+        d = load(client)
+        said = sweep(d, client, now)
+        if said:
+            save(client, d)
+        return said
+    finally:
+        lock.close()
+
+
+def _load_tool(name):
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_") + "_for_lots", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def shelf_write(client, lid, lot, wt, ready, now=None):
+    ""
+    row = lot.get("mapRow")
+    if not row:
+        return f"{lid}: no map row on the lot — nothing queued for the map"
+    head = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    branch = _git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")
+    repos = (json.load(open(pj)).get("repos") or {}) if os.path.exists(pj) else {}
+    _, b = repo_of(wt, repos)
+    st = "merged" if _git(wt, "rev-parse", "--verify", "-q", f"origin/{b or 'main'}").returncode == 0 \
+        and _is_ancestor(wt, head, f"origin/{b or 'main'}") else "local"
+    mw = _load_tool("map-writes")
+    order = _load_tool("pm-sync").ORDER
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import _map
+    mirror = _map.of(client, json.load(open(pj)) if os.path.exists(pj) else {},
+                     os.path.expanduser("~/.claude/iphtah-kit/clients")).path("capabilities")
+    cur, doc = None, {}
+    if os.path.exists(mirror):
+        rows = json.load(open(mirror, encoding="utf-8"))
+        rows = rows if isinstance(rows, list) else rows.get("rows") or list(rows.values())
+        doc = next((r for r in rows if r.get("id") == row), None) or {}
+        cur = doc.get("state")
+    stamp = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields = {"updatedAt": stamp, "built": {"lot": lid, "branch": branch, "head": head, "green": ready}}
+    path = mw.path_of(client)
+    pending = [w for w in mw.pending(path) if w.get("doc_id") == row]
+    for w in pending:
+        if ((w.get("fields") or {}).get("built") or {}).get("head") == head:
+            return f"{lid}: map write #{w['n']} for row {row} @ {head[:8]} already queued — not queued twice"
+    if mw.store_of(path) and (doc.get("built") or {}).get("head") == head:
+        return f"{lid}: row {row} @ {head[:8]} is already on the map — not written twice"
+    known = [x for x in [cur] + [(w.get("fields") or {}).get("state") for w in pending] if x in order]
+    cur = max(known, key=order.index) if known else cur
+    kept = cur in order and order.index(cur) >= order.index(st)
+    if not kept:
+        fields["state"] = st
+    w = mw.add(path, {"doc_id": row, "op": "update", "fields": fields})
+    did = f"map write #{w['n']} queued" if "applied" not in w else \
+        f"map written ({'commit ' + w['applied'][:12] if w['applied'] else 'already held'})"
+    return (f"{lid}: {did} — row {row} "
+            + (f"keeps « {cur} »" if kept else f"→ « {st} »") + f", {branch} @ {head[:8]}, green {ready}"
+            + ("" if "applied" in w else f" (map-writes --client {client} list)"))
+
+
+def subscription_path(client):
+    return os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/metrics/subscription.json")
+
+
+def fixed_costs(client, today=None):
+    ""
+    p = subscription_path(client) if client else None
+    if not p or not os.path.exists(p):
+        return {}
+    sub = json.load(open(p))
+    out = {}
+    for inv in sub.get("invoices_eur") or []:
+        m = str(inv.get("date", ""))[:7]
+        if m:
+            out[m] = out.get(m, 0.0) + float(inv.get("total") or 0)
+    now = (today or dt.date.today()).strftime("%Y-%m")
+    for item in sub.get("monthly_fixed_eur") or []:
+        try:
+            y, mo = map(int, str(item["from"])[:7].split("-"))
+        except (KeyError, ValueError):
+            print(f"lots: {p}: monthly_fixed_eur item {item.get('label', '?')!r} has no valid « from » (YYYY-MM): "
+                  "left out of the real cost", file=sys.stderr)
+            continue
+        until = item.get("until") or now
+        while f"{y:04d}-{mo:02d}" <= until:
+            k = f"{y:04d}-{mo:02d}"
+            out[k] = out.get(k, 0.0) + float(item.get("eur") or 0)
+            y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    return out
+
+
+def spread_real_cost(rows, started, fixed):
+    ""
+    months = {}
+    for r in rows:
+        m = (started.get(r["id"]) or "")[:7]
+        if m and r.get("usd"):
+            x = months.setdefault(m, {"fixed_eur": fixed.get(m, 0.0), "usd": 0.0, "lots": 0})
+            x["usd"] += r["usd"]
+            x["lots"] += 1
+    for m, eur in fixed.items():
+        months.setdefault(m, {"fixed_eur": eur, "usd": 0.0, "lots": 0})
+    for r in rows:
+        m = (started.get(r["id"]) or "")[:7]
+        x = months.get(m)
+        r["real_eur"] = (round(x["fixed_eur"] * r["usd"] / x["usd"], 2)
+                         if x and r.get("usd") and x["usd"] and x["fixed_eur"] else None)
+    return months
+
+
+def report(d, project, as_json=False, client=None, since=None):
+    act = actuals(d, project)
+    counts = defect_counts(client) if client else None
+    rows = []
+    for lid, lot in sorted(d["lots"].items(), key=lambda kv: kv[1].get("started", "")):
+        a = act.get(lid) or {}
+        rows.append({"id": lid, "class": lot.get("class"), "title": lot.get("title"),
+                     "human_days": lot.get("human_days"), "source": lot.get("estimate_source"),
+                     "pred_wtok": lot.get("pred_wtok"), "pred_agent_h": lot.get("pred_agent_h"),
+                     **{k: a.get(k) for k in ("agents", "wtok", "usd", "agent_h", "elapsed_h", "concurrency",
+                                              "models", "main_model", "efforts", "main_effort")},
+                     "chosen_model": short_model(lot.get("model")), "why_model": lot.get("why_model"),
+                     "chosen_effort": lot.get("effort"), "type": lot.get("type"), "protocol": lot.get("protocol"),
+                     "findings": a.get("findings") if a.get("findings") is not None else findings_for(counts, lid, lot),
+                     "first_pass_clean": a.get("first_pass_clean"), "build_agents": a.get("build_agents"),
+                     "modules": len((lot.get("shape") or {}).get("modules") or []) if lot.get("shape") else None,
+                     "review_rounds": a.get("review_rounds") if a.get("review_rounds") is not None
+                     else lot.get("review_rounds")})
+    months = spread_real_cost(rows, {lid: lot.get("started") for lid, lot in d["lots"].items()}, fixed_costs(client))
+    if since:
+        rows = [r for r in rows if (d["lots"][r["id"]].get("started") or "") >= since]
+    if as_json:
+        for r in rows:
+            r["forecast"] = d["lots"][r["id"]].get("forecast")
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    print("| lot | class | model | human-days est. | agents | modules | weighted tokens | API cost $ | real € | agent-hours | elapsed h | agents at once | agent-h per human-day |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    ratios = []
+    for r in rows:
+        ratio = (r["agent_h"] / r["human_days"]) if r.get("agent_h") and r.get("human_days") else None
+        if ratio:
+            ratios.append(ratio)
+        mm = r.get("main_model")
+        if mm:
+            extra = len(r["models"]) - 1
+            mm += f" +{extra}" if extra else ""
+            if r.get("chosen_model") and r["chosen_model"] != r["main_model"]:
+                mm += f" ≠{r['chosen_model']}"
+        me = r.get("main_effort")
+        if mm and me:
+            mm += f" · {me}"
+            if r.get("chosen_effort") and r["chosen_effort"] != me:
+                mm += f" ≠{r['chosen_effort']}"
+        print(f"| {r['id']} | {r['class'] or '—'} | {mm or '—'} | {r['human_days'] or '—'} ({r['source'] or '—'}) | {r['agents'] or '—'} | {r['modules'] if r.get('modules') is not None else '—'} | "
+              f"{fmt_m(r['wtok']) if r.get('wtok') else '—'} | {r['usd'] if r.get('usd') else '—'} | {r['real_eur'] if r.get('real_eur') is not None else '—'} | {r['agent_h'] if r.get('agent_h') is not None else '—'} | "
+              f"{r['elapsed_h'] if r.get('elapsed_h') is not None else '—'} | {r['concurrency'] if r.get('concurrency') is not None else '—'} | {f'{ratio:.2f}' if ratio else '—'} |")
+    print()
+    for m, x in sorted(months.items()):
+        if since and m < since[:7]:
+            continue
+        ratio = f"{x['fixed_eur'] / x['usd']:.3f} € per API $" if x["usd"] else "no priced lot to spread it on"
+        print(f"- real cost {m}: fixed €{x['fixed_eur']:.2f} paid, API-equivalent ${x['usd']:.2f} over {x['lots']} "
+              f"lot(s) (meetings included), ratio {ratio}")
+    if months:
+        print()
+    for c in CLASSES:
+        xs = [r for r in rows if r["class"] == c and r.get("wtok")]
+        if xs:
+            w = sorted(r["wtok"] for r in xs)
+            h = sorted(r["agent_h"] for r in xs)
+            u = sorted(r["usd"] or 0 for r in xs)
+            print(f"- class {c}: {len(xs)} lot(s); API cost median ${statistics.median(u):.0f}, max ${u[-1]:.0f}; weighted tokens median {fmt_m(statistics.median(w))}, "
+                  f"max {fmt_m(w[-1])}; agent-hours median {statistics.median(h):.1f}, max {h[-1]:.1f}")
+    by_type(rows)
+    by_protocol(rows)
+    med = {}
+    for c in CLASSES:
+        hs = [r["agent_h"] for r in rows if r["class"] == c and r.get("agent_h")]
+        if hs:
+            med[c] = statistics.median(hs)
+    lv = {}
+    for r in rows:
+        if r.get("concurrency") and r.get("agent_h") and med.get(r["class"]):
+            k = min(int(round(r["concurrency"])), 6)
+            lv.setdefault(k, []).append(r["agent_h"] / med[r["class"]])
+    if lv:
+        print("\n| agents at once | lots | agent-hours vs class median (median) |\n|---|---|---|")
+        for k in sorted(lv):
+            print(f"| {k}{'+' if k == 6 else ''} | {len(lv[k])} | ×{statistics.median(lv[k]):.2f} |")
+    bm = {}
+    for r in rows:
+        if r.get("main_model"):
+            key = r["main_model"] + (f" · {r['main_effort']}" if r.get("main_effort") else "")
+            bm.setdefault(key, []).append(r)
+    if bm:
+        def med_s(v, f="{:.1f}"):
+            v = [x for x in v if x is not None]
+            return f.format(statistics.median(v)) if v else "—"
+        def clean(xs):
+            v = [r["first_pass_clean"] for r in xs if r.get("first_pass_clean") is not None]
+            return f"{100 * sum(v) // len(v)} % ({len(v)})" if v else "—"
+        print("\n| main model · effort | lots | API cost $ per lot (median) | agent-hours per lot (median) | agent-h vs class median (median) | review findings per lot (median) | rework rounds per lot (median) | first-pass clean |\n|---|---|---|---|---|---|---|---|")
+        for m, xs in sorted(bm.items()):
+            ratio = [r["agent_h"] / med[r["class"]] for r in xs if r.get("agent_h") and med.get(r["class"])]
+            print(f"| {m} | {len(xs)} | {med_s([r['usd'] for r in xs if r.get('usd')], '{:.0f}')} | "
+                  f"{med_s([r['agent_h'] for r in xs if r.get('agent_h') is not None], '{:.2f}')} | "
+                  f"{med_s(ratio, '×{:.2f}')} | {med_s([r['findings'] for r in xs])} | "
+                  f"{med_s([r['review_rounds'] for r in xs])} | {clean(xs)} |")
+    calibration(rows, d)
+    if ratios:
+        print(f"\nOne human developer-day ≈ {statistics.median(ratios):.2f} agent-hours here "
+              f"(median over {len(ratios)} lots; range {min(ratios):.2f}–{max(ratios):.2f}). "
+              "Elapsed time to merge is set by review and deploy, not by this.")
+
+
+def q_at(v, p):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
+
+
+def forecast(cls, client=None):
+    ""
+    rows = pooled_rows()
+    xs = [r for r in rows if r["class"] == cls]
+    if len(xs) < 2:
+        return None
+    _, f = client_factors(rows)
+    fac, n = f.get(client, (1.0, 0))
+    fac = fac if n >= 3 else 1.0
+    u = [r["usd"] * fac for r in xs]; h = [r["agent_h"] * fac for r in xs]
+    return {"class": cls, "n": len(xs), "factor": round(fac, 2),
+            "usd_p50": round(q_at(u, .5), 2), "usd_p90": round(q_at(u, .9), 2),
+            "h_p50": round(q_at(h, .5), 2), "h_p90": round(q_at(h, .9), 2)}
+
+
+def band(actual, fc):
+    return "≤P50" if actual <= fc["h_p50"] else ("P50–P90" if actual <= fc["h_p90"] else ">P90")
+
+
+def calibration(rows, d):
+    ""
+    xs = [(r, d["lots"][r["id"]]["forecast"]) for r in rows
+          if d["lots"][r["id"]].get("forecast") and r.get("agent_h") is not None and r.get("agents")]
+    if not xs:
+        return
+    print("\n| lot | class at start → now | forecast agent-h P50 / P90 | actual | band | forecast $ P50 | actual $ |\n|---|---|---|---|---|---|---|")
+    bands = {"≤P50": 0, "P50–P90": 0, ">P90": 0}
+    for r, fc in xs:
+        b = band(r["agent_h"], fc)
+        bands[b] += 1
+        cls = fc["class"] + ("" if fc["class"] == r["class"] else f" → {r['class']}")
+        mark = " (rebuilt)" if fc.get("reconstructed") else ""
+        print(f"| {r['id']} | {cls} | {fc['h_p50']:.2f} / {fc['h_p90']:.2f}{mark} | {r['agent_h']:.2f} | {b} | "
+              f"{fc['usd_p50']:.0f} | {r['usd'] or 0:.0f} |")
+    n = len(xs)
+    p50 = sum(fc["h_p50"] for _, fc in xs); act = sum(r["agent_h"] for r, _ in xs)
+    u50 = sum(fc["usd_p50"] for _, fc in xs); uact = sum(r["usd"] or 0 for r, _ in xs)
+    print(f"\nCalibration over {n} lot(s): {bands['≤P50']} under P50 (target ~50 %), {bands['P50–P90']} between, "
+          f"{bands['>P90']} over P90 (target ~10 %: {100 * bands['>P90'] // n} % here). Agent-hours: P50 sum {p50:.1f} h, "
+          f"actual {act:.1f} h ({100 * (act - p50) / p50:+.0f} %). API cost: P50 sum ${u50:.0f}, actual ${uact:.0f}.")
+
+
+CELLS = [("opus", "medium"), ("sonnet", "medium"), ("fable", "medium"), ("opus", "high"), ("sonnet", "high")]
+MONEY_CELL = ("opus", "high")
+EXPERIMENT_START = "2026-10-05T21:00:00Z"
+
+
+PROTOCOL_START = "2026-10-06T08:45:00Z"
+
+
+def at_risk(t):
+    return bool(t) and (t.get("kind") in ("ticket", "look-and-feel") or t.get("layer") == "front")
+
+
+def stratum(lot):
+    t = lot.get("type") or {}
+    return (lot.get("class"), t.get("kind"), t.get("layer"))
+
+
+def protocol_arm(d, cls, t):
+    ""
+    key = (cls, t.get("kind"), t.get("layer"))
+    n = {"A": 0, "B": 0}
+    for lot in d["lots"].values():
+        if lot.get("protocol") in n and stratum(lot) == key and (lot.get("started") or "") >= PROTOCOL_START:
+            n[lot["protocol"]] += 1
+    return ("A" if n["A"] <= n["B"] else "B"), n
+
+
+def family(m):
+    ""
+    m = short_model(m) or ""
+    return next((f for f in ("fable", "opus", "sonnet", "haiku") if m.startswith(f)), None)
+
+
+def cell(d, project, cls, type_=None):
+    act = actuals(d, project)
+    counts = {c: 0 for c in CELLS}
+    for lid, lot in d["lots"].items():
+        if lot.get("class") != cls or lot.get("money") or (lot.get("started") or "") < EXPERIMENT_START:
+            continue
+        a = act.get(lid) or {}
+        c = (family(lot.get("model") or a.get("main_model")), lot.get("effort") or a.get("main_effort"))
+        if c in counts:
+            counts[c] += 1
+    nxt = min(CELLS, key=lambda c: (counts[c], CELLS.index(c)))
+    if type_ and at_risk(type_):
+        arm, n = protocol_arm(d, cls, type_)
+        print(f"at-risk stratum {cls}·{type_['kind']}·{type_['layer']}: protocol arms A {n['A']} / B {n['B']}")
+        print(f"next lot: opus · medium (baseline during the protocol experiment), protocol {arm}  →  "
+              f"lots … add <id> --class {cls} --type {type_['kind']}/{type_['layer']}/{type_['domain']} "
+              f"--model opus --effort medium --protocol {arm}"
+              + ("; brief: arm B's risk protocol (the kit developers' own, not in this kit)" if arm == "B" else ""))
+        return ("opus", "medium", arm)
+    print(f"class {cls}, ordinary lots per cell: " + ", ".join(f"{m} · {e} {counts[(m, e)]}" for m, e in CELLS))
+    print(f"next ordinary lot: {nxt[0]} · {nxt[1]}  →  lots … add <id> --class {cls} --model {nxt[0]} "
+          f"--effort {nxt[1]}; Agent model « {nxt[0]} », "
+          + ("type builder-high" if nxt[1] == "high" else "the session's default effort (medium)"))
+    print(f"money/rights lots: {MONEY_CELL[0]} · {MONEY_CELL[1]} (add --money), type money-rights-builder")
+    return nxt
+
+
+def selftest(project, n=8):
+    ""
+    files = sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/*/subagents/agent-*.jsonl")),
+                   key=os.path.getmtime)[-n:]
+    if not files:
+        return ["no sub-agent transcript found"]
+    recs = ids = usage = model = stamps = effort = 0
+    per_id = {}
+    for f in files:
+        for line in open(f, encoding="utf-8"):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            recs += 1
+            m = d.get("message") or {}
+            if m.get("id"):
+                ids += 1
+                per_id[m["id"]] = per_id.get(m["id"], 0) + 1
+            u = m.get("usage") or {}
+            usage += 1 if ("input_tokens" in u and "output_tokens" in u) else 0
+            model += 1 if m.get("model") else 0
+            effort += 1 if (d.get("perTurnEffort") or d.get("effort")) else 0
+            try:
+                ts(d["timestamp"]); stamps += 1
+            except (KeyError, ValueError):
+                pass
+    checks = [("assistant records", recs > 0), ("message ids", recs and ids / recs > 0.95),
+              ("usage with input and output tokens", recs and usage / recs > 0.95),
+              ("model", recs and model / recs > 0.95), ("timestamps", recs and stamps / recs > 0.95),
+              ("effort", recs and effort / recs > 0.5),
+              ("replies split over records (dedup still needed and working)", any(v > 1 for v in per_id.values()))]
+    mains = sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")), key=os.path.getmtime)[-3:]
+    if mains:
+        mrecs = musage = mstamps = 0
+        for f in mains:
+            for line in open(f, encoding="utf-8"):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "assistant" or d.get("isSidechain"):
+                    continue
+                mrecs += 1
+                u = (d.get("message") or {}).get("usage") or {}
+                musage += 1 if ("input_tokens" in u and "output_tokens" in u) else 0
+                try:
+                    ts(d["timestamp"]); mstamps += 1
+                except (KeyError, ValueError):
+                    pass
+        checks += [("main session: assistant records", mrecs > 0),
+                   ("main session: usage and timestamps", mrecs and musage / mrecs > 0.95 and mstamps / mrecs > 0.95)]
+    fails = []
+    for name, ok in checks:
+        print(f"{'OK  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            fails.append(name)
+    print(f"{recs} assistant records, {len(per_id)} replies, {len(files)} transcripts")
+    return fails
+
+
+def by_protocol(rows):
+    ""
+    med = {c: statistics.median([r["agent_h"] for r in rows if r["class"] == c and r.get("agent_h")])
+           for c in CLASSES if any(r["class"] == c and r.get("agent_h") for r in rows)}
+    g = {}
+    for r in rows:
+        if r.get("protocol") and r.get("agent_h") and r.get("type"):
+            k = (r["class"], r["type"]["kind"], r["type"]["layer"])
+            g.setdefault(k, {}).setdefault(r["protocol"], []).append(r)
+    if not g:
+        return
+    print("\n| stratum | arm | lots | agent-h vs class median (median) | first-pass clean |\n|---|---|---|---|---|")
+    for k in sorted(g):
+        for arm in ("A", "B"):
+            xs = g[k].get(arm, [])
+            if not xs:
+                continue
+            ratio = [r["agent_h"] / med[r["class"]] for r in xs if med.get(r["class"])]
+            fp = [r["first_pass_clean"] for r in xs if r.get("first_pass_clean") is not None]
+            print(f"| {'·'.join(k)} | {arm} | {len(xs)} | {'×%.2f' % statistics.median(ratio) if ratio else '—'} | "
+                  f"{f'{100 * sum(fp) // len(fp)} % ({len(fp)})' if fp else '—'} |")
+
+
+def by_type(rows):
+    ""
+    med = {}
+    for c in CLASSES:
+        hs = [r["agent_h"] for r in rows if r["class"] == c and r.get("agent_h")]
+        if hs:
+            med[c] = statistics.median(hs)
+    done = [r for r in rows if r.get("agent_h")]
+    untyped = sum(1 for r in done if not r.get("type"))
+    for dim in ("kind", "layer", "domain"):
+        g = {}
+        for r in done:
+            if r.get("type"):
+                g.setdefault(r["type"][dim], []).append(r)
+        if not g:
+            continue
+        print(f"\n| {dim} | lots | agent-h (median) | API cost $ (median) | agent-h vs class median (median) | first-pass clean |"
+              "\n|---|---|---|---|---|---|")
+        for k, xs in sorted(g.items(), key=lambda kv: -len(kv[1])):
+            ratio = [r["agent_h"] / med[r["class"]] for r in xs if med.get(r["class"])]
+            fp = [r["first_pass_clean"] for r in xs if r.get("first_pass_clean") is not None]
+            print(f"| {k} | {len(xs)} | {statistics.median(r['agent_h'] for r in xs):.2f} | "
+                  f"{statistics.median((r.get('usd') or 0) for r in xs):.1f} | "
+                  f"{'×%.2f' % statistics.median(ratio) if ratio else '—'} | "
+                  f"{f'{100 * sum(fp) // len(fp)} % ({len(fp)})' if fp else '—'} |")
+    if untyped:
+        print(f"\n{untyped} lot(s) with figures but no type: `lots type <id> kind/layer/domain`.")
+
+
+def predict(d, project, cls, client=None):
+    rows = pooled_rows()
+    xs = [r for r in rows if r["class"] == cls]
+    if len(xs) >= 2:
+        def q(v, p):
+            v = sorted(v)
+            return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
+        _, f = client_factors(rows)
+        fac, n = f.get(client, (1.0, 0))
+        fac = fac if n >= 3 else 1.0
+        u = [r["usd"] * fac for r in xs]; h = [r["agent_h"] * fac for r in xs]
+        print(f"class {cls}, pooled over {len(xs)} lots, client factor × {fac:.2f}"
+              f"{'' if n >= 3 else ' (not enough lots for this client: 1.0)'}: "
+              f"API cost P50 ${q(u, .5):.0f}, P90 ${q(u, .9):.0f}; agent-hours P50 {q(h, .5):.1f}, P90 {q(h, .9):.1f}")
+        return
+    act = actuals(d, project)
+    xs = [act[l] for l, lot in d["lots"].items() if lot.get("class") == cls and act.get(l)]
+    if len(xs) < 2:
+        sys.exit(f"class {cls}: {len(xs)} finished lot(s) — not enough history; estimate by hand and say so")
+    def q(v, p):
+        v = sorted(v)
+        return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
+    w = [x["wtok"] for x in xs]
+    h = [x["agent_h"] for x in xs]
+    print(f"class {cls} from {len(xs)} lots: weighted tokens P50 {fmt_m(q(w, .5))}, P90 {fmt_m(q(w, .9))}; "
+          f"agent-hours P50 {q(h, .5):.1f}, P90 {q(h, .9):.1f}")
+
+
+def p90s():
+    ""
+    rows = pooled_rows()
+    out = {}
+    for c in CLASSES:
+        xs = [r for r in rows if r["class"] == c]
+        if len(xs) >= 2:
+            q = lambda v: sorted(v)[min(len(v) - 1, int(round(.9 * (len(v) - 1))))]
+            out[c] = (q([r["usd"] for r in xs]), q([r["agent_h"] for r in xs]))
+    return out
+
+
+STALE_DAYS = 3
+
+
+def open_lots(d, now=None):
+    ""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    opened, stale = [], []
+    for lid, lot in d["lots"].items():
+        if is_closed(lot):
+            continue
+        started = lot.get("started")
+        (stale if started and (now - ts(started)).days >= STALE_DAYS else opened).append(lid)
+    return opened, stale
+
+
+def over(d, project):
+    ""
+    act = actuals(d, project)
+    lim = p90s()
+    found = []
+    opened, stale = open_lots(d)
+    stale = [lid for lid in stale if d["lots"][lid].get("class") in lim and act.get(lid)]
+    for lid in opened:
+        lot = d["lots"][lid]
+        if lot.get("class") not in lim or not act.get(lid):
+            continue
+        usd90, h90 = lim[lot["class"]]
+        a = act[lid]
+        if a["usd"] > usd90 or a["agent_h"] > h90:
+            found.append(lid)
+            print(f"{lid} ({lot['class']}): ${a['usd']:.0f} / {a['agent_h']:.1f} agent-h, past P90 "
+                  f"${usd90:.0f} / {h90:.1f} h — re-class it: lots reclass {lid} --class <next> --reason \"…\"")
+    if stale:
+        print(f"never closed (started 3+ days ago, no ready time): {', '.join(sorted(stale))} — close them with lot-close or `lots done`")
+    return found
+
+
+READ_ONLY = {"report", "predict", "pooled", "selftest", "cell", "over", "open", "closed"}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--client", required=True)
+    ap.add_argument("--project", help="Claude Code project directory (default: the client's claude_project in "
+                    "project.json, else the current directory's)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("add"); p.add_argument("id"); p.add_argument("--title", required=True)
+    p.add_argument("--class", dest="cls", choices=CLASSES,
+                   help="required, except for a meeting lot (--type meeting/…), which has no class")
+    p.add_argument("--session", help="main-session id to attribute to this lot (see `session`)")
+    p.add_argument("--since"); p.add_argument("--until")
+    p.add_argument("--human-days", type=float); p.add_argument("--estimate-source")
+    p.add_argument("--pred-wtok", type=float); p.add_argument("--pred-agent-h", type=float)
+    p.add_argument("--agents", default=""); p.add_argument("--started")
+    p.add_argument("--model"); p.add_argument("--why-model")
+    p.add_argument("--map-row", help="the product map row this lot builds (queue-tick skips it while the lot is open)")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--type", help="kind/layer/domain from TAXONOMY, e.g. fix/front/documents")
+    p.add_argument("--protocol", choices=["A", "B"], help="the protocol arm, from `lots cell --type` (at-risk strata)")
+    p.add_argument("--money", action="store_true", help="moves money or rights: fixed at opus · high, not rotated")
+    p.add_argument("--ticket", action="store_true")
+    p.add_argument("--delivery-target", help="ISO time the lot is promised for (launch-lot gives queue-tick's next drop); "
+                   "it is kept beside the lot's `ready` stamp, to score the promise")
+    p = sub.add_parser("agents"); p.add_argument("id"); p.add_argument("ids")
+    p = sub.add_parser("session", help="attach a slice of a main-session transcript to a lot")
+    p.add_argument("id"); p.add_argument("session"); p.add_argument("--since"); p.add_argument("--until")
+    sub.add_parser("sessions-sync", help="every main session on no lot becomes a meeting lot (09/10/2026)")
+    p = sub.add_parser("done"); p.add_argument("id")
+    for k in ("ready", "merged", "deployed"):
+        p.add_argument(f"--{k}")
+    p.add_argument("--review-rounds", type=int)
+    p.add_argument("--worktree", action="append", default=[], help="the lot's worktree, one per repository")
+    p.add_argument("--base", help="the base to diff against (default: the repository's in project.json)")
+    p = sub.add_parser("park"); p.add_argument("id"); p.add_argument("--reason", required=True)
+    p.add_argument("--at")
+    p = sub.add_parser("resume"); p.add_argument("id"); p.add_argument("--at")
+    p = sub.add_parser("report"); p.add_argument("--json", action="store_true"); p.add_argument("--since")
+    p = sub.add_parser("predict"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
+    p = sub.add_parser("pooled"); p.add_argument("--class", dest="cls", choices=CLASSES)
+    sub.add_parser("selftest")
+    sub.add_parser("freeze")
+    p = sub.add_parser("cell"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
+    p.add_argument("--type", help="kind/layer/domain: in an at-risk stratum, the protocol arm is chosen too")
+    sub.add_parser("over")
+    sub.add_parser("sweep", help="open lots whose branch is already in its base get their merged time (queue-tick runs it)")
+    p = sub.add_parser("shelve", help="queue the map write of a closed lot through map-writes (lot-close runs it)")
+    p.add_argument("id"); p.add_argument("--worktree", required=True); p.add_argument("--ready", required=True)
+    p_open = sub.add_parser("open", help="ids of the open lots, one per line (disk-guard keeps their worktrees)")
+    p_open.add_argument("--branches", action="store_true", help="also each open lot's branch, when it is not its id")
+    sub.add_parser("closed", help="ids of the closed lots, one per line (disk-guard: stale worktree locks)")
+    p = sub.add_parser("type"); p.add_argument("id"); p.add_argument("value", help="kind/layer/domain")
+    p = sub.add_parser("reclass"); p.add_argument("id"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
+    p.add_argument("--reason", required=True)
+    a = ap.parse_args()
+    if not a.project:
+        pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")
+        a.project = (json.load(open(pj)).get("claude_project") if os.path.exists(pj) else None) \
+            or "~/.claude/projects/" + os.getcwd().replace("/", "-")
+    lock = None if a.cmd in READ_ONLY else ledger_lock(a.client)
+    d = load(a.client)
+    fj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/flow.json")
+    if os.path.exists(fj):
+        PRICES.update(json.load(open(fj)).get("token_prices_per_mtok") or {})
+    if a.cmd == "add":
+        if a.id in d["lots"]:
+            old = d["lots"][a.id]
+            sys.exit(f"add: lot {a.id} already exists (« {old.get('title', '')} », started {old.get('started', '?')}"
+                     f"{', closed' if is_closed(old) else ''}): nothing changed. A new lot takes a new id; this one "
+                     f"changes with `reclass`, `type`, `agents` or `done`")
+        cls = a.cls
+        meeting = bool(a.type) and parse_type(a.type)["kind"] == "meeting"
+        if not cls and not meeting:
+            sys.exit("add: --class is required (only a meeting lot, --type meeting/…, has none)")
+        if (a.since or a.until) and not a.session:
+            sys.exit("add: --since/--until only go with --session")
+        if a.ticket and cls and CLASSES.index(cls) < CLASSES.index("M"):
+            print(f"{a.id}: a ticket fix starts as M (asked {cls}); once the cause is known: "
+                  f"lots --client {a.client} reclass {a.id} --class {cls} --reason \"cause: …\"")
+            cls = "M"
+        cls = None if meeting else cls
+        fc = None if meeting else forecast(cls, a.client)
+        if meeting:
+            print(f"{a.id}: meeting lot, no class and no forecast")
+        elif fc:
+            fc["at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            print(f"{a.id} ({cls}) forecast frozen: agent-hours P50 {fc['h_p50']:.1f}, P90 {fc['h_p90']:.1f}; "
+                  f"API cost P50 ${fc['usd_p50']:.0f}, P90 ${fc['usd_p90']:.0f}")
+        else:
+            print(f"{a.id} ({cls}): no class history — no forecast stored; estimate by hand and say so")
+        d["lots"][a.id] = {k: v for k, v in {
+            "title": a.title, "class": cls, "forecast": fc, "kind": "ticket" if a.ticket else None, "human_days": a.human_days, "estimate_source": a.estimate_source,
+            "pred_wtok": a.pred_wtok, "pred_agent_h": a.pred_agent_h,
+            "model": a.model, "why_model": a.why_model, "effort": a.effort, "money": True if a.money else None,
+            "mapRow": a.map_row, "delivery_target": a.delivery_target,
+            "type": parse_type(a.type) if a.type else None, "protocol": a.protocol,
+            "agents": [x for x in a.agents.split(",") if x],
+            "started": a.started or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}.items()
+            if v is not None}
+        if a.session:
+            attach_session(d, a.id, a.session, a.since, a.until)
+        save(a.client, d)
+    elif a.cmd == "session":
+        attach_session(d, a.id, a.session, a.since, a.until)
+        save(a.client, d)
+    elif a.cmd == "sessions-sync":
+        taken = {x["id"] for lot in d["lots"].values() for x in lot.get("sessions", [])}
+        added = 0
+        for sid, f in sorted(session_files(a.project).items()):
+            if sid in taken:
+                continue
+            first = None
+            for line in open(f):
+                m = re.search(r'"timestamp":"([0-9T:.-]+)', line)
+                if m:
+                    first = m.group(1); break
+            if not first:
+                continue
+            lid = f"meeting-{first[:10]}-{sid[:8]}"
+            d["lots"][lid] = {"title": "Main session (conversation with the person)", "type": parse_type("meeting/cross/ops"),
+                              "agents": [], "started": first[:19] + "+00:00"}
+            attach_session(d, lid, sid)
+            print(f"{lid}: main session attached")
+            added += 1
+        save(a.client, d)
+        print(f"sessions-sync: {added} main session(s) added")
+    elif a.cmd in ("park", "resume"):
+        lot = d["lots"][a.id]
+        at = a.at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        ev = {"parked": at, "reason": a.reason} if a.cmd == "park" else {"resumed": at}
+        lot.setdefault("parks", []).append(ev)
+        save(a.client, d)
+    elif a.cmd == "agents":
+        lot = d["lots"][a.id]
+        lot["agents"] = sorted(set(lot.get("agents", [])) | {x for x in a.ids.split(",") if x})
+        save(a.client, d)
+    elif a.cmd == "done":
+        lot = d["lots"][a.id]
+        for k in ("ready", "merged", "deployed"):
+            if getattr(a, k):
+                lot[k] = getattr(a, k)
+        if a.review_rounds is not None:
+            lot["review_rounds"] = a.review_rounds
+        if a.worktree:
+            br = _git(a.worktree[0], "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            if br and br != "HEAD":
+                lot.setdefault("branch", br)
+            pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")
+            repos = json.load(open(pj)).get("repos") if os.path.exists(pj) else {}
+            try:
+                lot["shape"] = diff_shape(a.worktree, repos, a.base)
+                sh = lot["shape"]
+                print(f"{a.id}: {sh['files']} files, {sh['lines']} lines, {len(sh['modules'])} modules "
+                      f"({', '.join(sh['modules'])})")
+            except Unmeasured as e:
+                print(f"{a.id}: shape NOT measured ({e}){'; the shape already recorded is kept' if lot.get('shape') else ''}"
+                      f" — give --base <the parent of the lot's first commit>", file=sys.stderr)
+        froz = actuals(d, a.project).get(a.id)
+        if froz and not lot.get("actuals"):
+            lot["actuals"] = dict(froz, frozen_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+        save(a.client, d)
+    elif a.cmd == "freeze":
+        act = actuals(d, a.project)
+        n = 0
+        for lid, lot in d["lots"].items():
+            if is_closed(lot) and not lot.get("actuals") and act.get(lid):
+                lot["actuals"] = dict(act[lid], frozen_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+                n += 1
+        save(a.client, d)
+        print(f"{n} closed lot(s) frozen")
+    elif a.cmd == "report":
+        report(d, a.project, a.json, a.client, a.since)
+    elif a.cmd == "predict":
+        predict(d, a.project, a.cls, a.client)
+    elif a.cmd == "pooled":
+        pooled(a.cls)
+    elif a.cmd == "selftest":
+        sys.exit(1 if selftest(a.project) else 0)
+    elif a.cmd == "cell":
+        cell(d, a.project, a.cls, parse_type(a.type) if a.type else None)
+    elif a.cmd == "over":
+        over(d, a.project)
+    elif a.cmd == "sweep":
+        said = sweep(d, a.client)
+        if said:
+            save(a.client, d)
+        print("\n".join(said) or "sweep: no open lot whose branch is already in its base")
+    elif a.cmd == "shelve":
+        if a.id not in d["lots"]:
+            sys.exit(f"shelve: no lot {a.id} in the ledger")
+        try:
+            print(shelf_write(a.client, a.id, d["lots"][a.id], a.worktree, a.ready))
+        except (ValueError, RuntimeError) as e:
+            sys.exit(f"shelve: the map was not written — {e}")
+    elif a.cmd == "open":
+        ids = open_lots(d)[0]
+        names = set(ids) | ({d["lots"][i].get("branch") for i in ids} - {None, ""} if a.branches else set())
+        print("\n".join(sorted(names)))
+    elif a.cmd == "closed":
+        print("\n".join(sorted(lid for lid, lot in d["lots"].items() if is_closed(lot))))
+    elif a.cmd == "type":
+        d["lots"][a.id]["type"] = parse_type(a.value)
+        save(a.client, d)
+        print(a.id, "→", a.value)
+    elif a.cmd == "reclass":
+        lot = d["lots"][a.id]
+        lot.setdefault("reclassed", []).append({"from": lot.get("class"), "to": a.cls, "reason": a.reason,
+                                                "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+        lot["class"] = a.cls
+        save(a.client, d)
+
+
+if __name__ == "__main__":
+    main()

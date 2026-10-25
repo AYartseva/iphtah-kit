@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""save-check <repo> [--base REF] [--head REF] [--client C] [--strict]
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OK = re.compile(r"//\s*save-check:\s*ok\s+\S")
+READ = re.compile(r"\b(\w+)\s*\.\s*(findById|getReferenceById|getById|getOne|findBy\w*|findOne\w*|findFirst\w*)"
+                  r"\s*\(")
+SAVE = re.compile(r"\b(\w+)\s*\.\s*(save|saveAndFlush)\s*\(\s*(\w+)\b(?!\s*\()")
+NOT_METHODS = {"if", "for", "while", "switch", "catch", "synchronized", "try", "else", "do", "return", "new",
+               "finally", "static"}
+VOID_HANDLER = re.compile(r"\b(onOk|onClick)\s*=\s*\{\s*(?:async\s*)?\(\s*\)\s*=>\s*\{\s*void\s")
+
+
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.stderr.write(f"save-check: git {' '.join(args)}: {r.stderr.strip()}\n")
+        sys.exit(2)
+    return r.stdout
+
+
+def resolve_base(repo, base, client):
+    if base:
+        return base
+    try:
+        project = SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project")).load_module()
+        b = project.base_of(repo, client)
+    except Exception:
+        b = None
+    return f"origin/{b}" if b else "origin/main"
+
+
+def added_lines(repo, mb, head, path):
+    ""
+    out, lines = git(repo, "diff", "-U0", mb, head, "--", path), set()
+    for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", out, re.M):
+        start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+        lines.update(range(start, start + count))
+    return lines
+
+
+def mask_java(src):
+    ""
+    out, i, n = list(src), 0, len(src)
+    while i < n:
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+        elif src.startswith('"""', i):
+            j = src.find('"""', i + 3)
+            j = n if j < 0 else j + 3
+        elif src[i] in "\"'":
+            q, j = src[i], i + 1
+            while j < n and src[j] != q and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j += 1
+        else:
+            i += 1
+            continue
+        for k in range(i, min(j, n)):
+            if out[k] != "\n":
+                out[k] = " "
+        i = j
+    return "".join(out)
+
+
+def methods(masked):
+    ""
+    found, stack = [], []
+    last = 0
+    for i, ch in enumerate(masked):
+        if ch == "{":
+            header = masked[last:i]
+            m = re.search(r"\b([A-Za-z_]\w*)\s*\((?:[^()]|\([^()]*\))*\)\s*(?:throws\s+[\w.,\s]+)?\s*$", header)
+            is_method = bool(m) and m.group(1) not in NOT_METHODS and \
+                not re.search(r"\b(class|interface|enum|record)\b", header) and \
+                not re.search(r"\bnew\s+[\w.<>]+\s*\([^)]*\)\s*$", header) and \
+                not re.search(r"->\s*$", header)
+            stack.append((m.group(1), last + m.start(), i) if is_method else None)
+            last = i + 1
+        elif ch == "}":
+            if stack:
+                top = stack.pop()
+                if top:
+                    found.append((top[0], top[1], top[2], i))
+            last = i + 1
+        elif ch == ";":
+            last = i + 1
+    found.sort(key=lambda t: t[3] - t[2])
+    return found
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+class Entities:
+    ""
+
+    def __init__(self, repo, head):
+        self.repo, self.head = repo, head
+        self.files = [f for f in git(repo, "ls-tree", "-r", "--name-only", head).splitlines() if f.endswith(".java")]
+        self.cache = {}
+
+    def source(self, cls):
+        if cls not in self.cache:
+            hits = [f for f in self.files if os.path.basename(f) == f"{cls}.java"]
+            self.cache[cls] = git(self.repo, "show", f"{self.head}:{hits[0]}", check=False) if hits else None
+        return self.cache[cls]
+
+    def versioned(self, cls, depth=0):
+        src = self.source(cls)
+        if src is None or depth > 3:
+            return None
+        if re.search(r"@(?:jakarta\.persistence\.|javax\.persistence\.)?Version\b", mask_java_keep_annotations(src)):
+            return True
+        parent = re.search(r"\bclass\s+" + re.escape(cls) + r"\b[^{]*?\bextends\s+([\w.]+)", src)
+        if parent:
+            return self.versioned(parent.group(1).split(".")[-1], depth + 1) is True
+        return False
+
+    def of_repository(self, repo_type):
+        src = self.source(repo_type)
+        if not src:
+            return None
+        m = re.search(r"\b\w*Repository\s*<\s*([\w.]+)\s*,", src)
+        return m.group(1).split(".")[-1] if m else None
+
+
+def mask_java_keep_annotations(src):
+    return re.sub(r"//[^\n]*|/\*.*?\*/", " ", src, flags=re.S)
+
+
+def java_findings(repo, mb, head, path, entities):
+    src = git(repo, "show", f"{head}:{path}")
+    masked = mask_java(src)
+    raw_lines = src.splitlines()
+    touched = added_lines(repo, mb, head, path)
+    out, saves_seen = [], set()
+    for name, hstart, bstart, bend in methods(masked):
+        first, last = line_of(masked, hstart), line_of(masked, bend)
+        if not any(first <= ln <= last for ln in touched):
+            continue
+        body = masked[bstart:bend]
+        reads = {}
+        for m in re.finditer(r"(?:\bfinal\s+)?([\w.]+(?:<[\w.<>, ?]+>)?)\s+(\w+)\s*=\s*([^;]*)", body):
+            rhs = m.group(3)
+            r = READ.search(rhs)
+            if not r:
+                continue
+            if not (r.group(2) in ("findById", "getReferenceById", "getById", "getOne") or
+                    re.search(r"\.\s*orElse(?:Throw|Get)?\s*\(", rhs) or
+                    r.group(2).startswith(("findBy", "findOne", "findFirst"))):
+                continue
+            declared = m.group(1)
+            if declared in ("return",):
+                continue
+            opt = re.match(r"Optional<\s*([\w.]+)\s*>", declared)
+            etype = opt.group(1) if opt else (None if declared == "var" else declared)
+            if etype and ("<" in etype or etype in ("List", "Set", "Collection", "Page", "Stream", "Iterable")):
+                continue
+            reads[m.group(2)] = (etype.split(".")[-1] if etype else None, r.group(1), bstart + m.start())
+        if not reads:
+            continue
+        for s in SAVE.finditer(body):
+            var = s.group(3)
+            if var not in reads or reads[var][2] > bstart + s.start() or bstart + s.start() in saves_seen \
+                    or (bstart, var) in saves_seen:
+                continue
+            saves_seen.add(bstart + s.start())
+            etype, repo_var, _ = reads[var]
+            if etype is None:
+                decl = re.search(r"\b(\w+)\s+" + re.escape(repo_var) + r"\s*[;=,)]", masked)
+                etype = entities.of_repository(decl.group(1)) if decl else None
+            if etype and entities.versioned(etype):
+                continue
+            ln = line_of(masked, bstart + s.start())
+            if OK.search(raw_lines[ln - 1] if ln <= len(raw_lines) else ""):
+                continue
+            saves_seen.add((bstart, var))
+            out.append(f"{path}:{ln} — {name}(): {etype or '?'} `{var}` read then saved whole — "
+                       "add @Version, or a conditional UPDATE of the changed columns")
+    return out
+
+
+def ts_findings(repo, mb, head, path):
+    src = git(repo, "show", f"{head}:{path}")
+    raw_lines = src.splitlines()
+    touched = added_lines(repo, mb, head, path)
+    out = []
+    for m in VOID_HANDLER.finditer(src):
+        first, last = line_of(src, m.start()), line_of(src, m.end())
+        if not any(first <= ln <= last for ln in touched):
+            continue
+        if any(OK.search(raw_lines[ln - 1]) for ln in range(first, last + 1) if ln <= len(raw_lines)):
+            continue
+        out.append(f"{path}:{first} — {m.group(1)} voids its promise: return the promise "
+                   "(the gesture can fire twice)")
+    return out
+
+
+def run(repo, base, head="HEAD"):
+    mb = git(repo, "merge-base", base, head).strip()
+    changed = [l.split("\t")[-1] for l in git(repo, "diff", "--name-status", "-M", mb, head).splitlines()
+               if l and l[0] in "AMRC"]
+    java = [f for f in changed if f.endswith(".java") and "/test/" not in f]
+    ts = [f for f in changed if re.search(r"\.(tsx?|jsx?)$", f) and not re.search(r"\.(test|spec)\.", f)]
+    findings = []
+    if java:
+        entities = Entities(repo, head)
+        for f in java:
+            findings += java_findings(repo, mb, head, f, entities)
+    for f in ts:
+        findings += ts_findings(repo, mb, head, f)
+    return findings, len(java) + len(ts)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repo")
+    ap.add_argument("--base")
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--client")
+    ap.add_argument("--strict", action="store_true", help="exit 1 when there are findings")
+    a = ap.parse_args()
+    repo = os.path.expanduser(a.repo)
+    base = resolve_base(repo, a.base, a.client)
+    findings, files = run(repo, base, a.head)
+    for f in findings:
+        print(f"warn    {f}")
+    print(f"save-check: {files} changed Java/TS file(s) against {base}: {len(findings)} finding(s)")
+    return 1 if a.strict and findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

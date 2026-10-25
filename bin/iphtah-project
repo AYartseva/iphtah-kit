@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""iphtah-project — what Iphtah's tools need to know about a client's repositories.
+
+    iphtah-project env <repo> [--client C]
+    iphtah-project where <path>
+    iphtah-project repos [--client C]
+    iphtah-project gated [--client C]
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import sys
+
+CLIENTS = os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
+
+
+def expand(p):
+    return os.path.realpath(os.path.expanduser(p)) if p else p
+
+
+def load():
+    out = {}
+    for f in sorted(glob.glob(os.path.join(CLIENTS, "*", "project.json"))):
+        cfg = json.load(open(f))
+        out[cfg["client"]] = cfg
+    return out
+
+
+def find_repo(name, client=None):
+    hits = [(c, cfg) for c, cfg in load().items()
+            if name in cfg.get("repos", {}) and (client is None or c == client)]
+    if not hits:
+        sys.exit(f"iphtah-project: no client has a repo named '{name}'")
+    if len(hits) > 1:
+        sys.exit(f"iphtah-project: '{name}' exists for {[c for c, _ in hits]} — pass --client")
+    return hits[0]
+
+
+def where(path):
+    path = expand(path)
+    for c, cfg in load().items():
+        for name, r in cfg.get("repos", {}).items():
+            if expand(r["path"]) == path:
+                return {"client": c, "repo": name, **r, "state_dir": expand(cfg["state_dir"]),
+                        "bypass_env": cfg.get("bypass_env", "IPHTAH_PUSH_UNCHECKED")}
+    return None
+
+
+def repo_of(path, client=None):
+    ""
+    import subprocess
+    r = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"], capture_output=True, text=True)
+    remote = r.stdout.strip()
+    for c, cfg in load().items():
+        if client and c != client:
+            continue
+        for name, repo in cfg.get("repos", {}).items():
+            gh = repo.get("github")
+            if gh and remote and re.search(r"[:/]" + re.escape(gh) + r"(\.git)?/?$", remote):
+                return {"client": c, "repo": name, **repo}
+    return None
+
+
+LIGHT_KIND = "pysuite"
+LIGHT_BUILD = re.compile(r"python3? -m unittest[\w \t./=:,-]*")
+
+
+def queue_kind(repo):
+    ""
+    if repo.get("queued_kind"):
+        return repo["queued_kind"]
+    build = repo.get("build", "")
+    if "mvn" in build:
+        return "maven"
+    if "vitest" in build:
+        return "vitest"
+    if LIGHT_BUILD.fullmatch(build):
+        return "py"
+    return None
+
+
+def light_kind(repo):
+    ""
+    return LIGHT_KIND if LIGHT_BUILD.fullmatch(repo.get("build") or "") else ""
+
+
+def full_build_line(client, name, repo, branch="<branch>"):
+    ""
+    mc = f"~/.claude/iphtah-kit/bin/merge-check {name} {branch} --local --client {client}"
+    k = light_kind(repo or {})
+    if k:
+        return f"{mc}   (light repository: merge-check queues in a {k} slot itself, never behind the load)"
+    return f"~/.claude/iphtah-kit/bin/when-quiet -- {mc}"
+
+
+def base_of(path, client=None):
+    ""
+    repo = repo_of(path, client)
+    return repo.get("base") if repo else None
+
+
+def main():
+    a = sys.argv[1:]
+    client = None
+    if "--client" in a:
+        i = a.index("--client"); client = a[i + 1]; del a[i:i + 2]
+    if not a:
+        print(__doc__); sys.exit(2)
+    if a[0] == "env":
+        c, cfg = find_repo(a[1], client)
+        r = cfg["repos"][a[1]]
+        values = {
+            "CLIENT": c, "REPO": a[1], "SRC": expand(r["path"]), "GITHUB": r.get("github", ""),
+            "BASE": r["base"], "BUILD": r["build"], "BURST": expand(r["burst"].split()[0]) + " " + " ".join(r["burst"].split()[1:]) if r.get("burst") else "",
+            "LOCK": r.get("lock", ""), "LIGHT_KIND": light_kind(r), "LOCK_SLOTS": str(r.get("lock_slots", 1)), "STATE": expand(cfg["state_dir"]), "WT": expand(cfg["worktrees"]),
+            "AUTHOR": cfg.get("author", ""),
+        }
+        for k, v in values.items():
+            print(f"{k}={shlex.quote(v)}")
+    elif a[0] == "where":
+        print(json.dumps(where(a[1])))
+    elif a[0] == "repos":
+        print(json.dumps({c: cfg["repos"] for c, cfg in load().items() if client in (None, c)}, indent=1))
+    elif a[0] == "gated":
+        for c, cfg in load().items():
+            for n, r in (cfg.get("repos") or {}).items():
+                if client in (None, c) and r.get("gate") is not False and r.get("github") and r.get("build"):
+                    print(c, n)
+    else:
+        sys.exit(f"iphtah-project: unknown command {a[0]}")
+
+
+if __name__ == "__main__":
+    main()

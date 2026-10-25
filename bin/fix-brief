@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""fix-brief --client C --repo R <lot> <findings-file> [--front] [--branch B] [--contract-first] [--purpose-file F]
+"""
+import argparse, hashlib, json, os, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _purpose as P
+
+def scratch_root():
+    return os.environ.get("CLAUDE_SCRATCHPAD") or os.path.expanduser("~/.local/state/iphtah-kit/scratch")
+
+def record_round(lot, findings):
+    ""
+    try:
+        os.makedirs(P.lot_dir(lot), exist_ok=True)
+        f = os.path.join(P.lot_dir(lot), "fix-rounds.jsonl")
+        sha = hashlib.sha256(findings.encode()).hexdigest()[:12]
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "findings_sha": sha}) + "\n")
+        shas = set()
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for l in fh:
+                try:
+                    shas.add(json.loads(l)["findings_sha"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+        return len(shas)
+    except OSError as e:
+        print(f"fix-brief: warning: round log not written ({e}); round count unknown", file=sys.stderr)
+        return None
+
+def full_build_line(client, repo, branch):
+    ""
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader("iphtah_project", os.path.join(os.path.dirname(os.path.realpath(__file__)), "iphtah-project"))
+    proj = importlib.util.module_from_spec(importlib.util.spec_from_loader("iphtah_project", loader))
+    loader.exec_module(proj)
+    try:
+        entry = ((proj.load().get(client) or {}).get("repos") or {}).get(repo) or {}
+    except (OSError, ValueError, KeyError):
+        entry = {}
+    return proj.full_build_line(client, repo, entry, branch)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--client", required=True)
+    ap.add_argument("lot")
+    ap.add_argument("findings")
+    ap.add_argument("--repo", required=True, help="the repository's short name in the client's project.json")
+    ap.add_argument("--front", action="store_true", help="a front lot: add the phone e2e step")
+    ap.add_argument("--branch", help="the lot's branch, named in the merge-check line")
+    ap.add_argument("--contract-first", action="store_true",
+                    help="contract changes go on the contract branch first, then merged back")
+    ap.add_argument("--purpose-file", help="what the code is for, against what (accident or adversary), what it must never block")
+    a = ap.parse_args()
+    findings = open(a.findings, encoding="utf-8").read().strip()
+    repo = a.repo
+    branch = a.branch or "<branch>"
+    scratch = os.path.join(scratch_root(), a.lot)
+    if not P.valid_lot(a.lot):
+        ap.error(f"the lot must be a plain name (no path, not . or ..), got {a.lot!r}")
+    try:
+        purpose = P.read_purpose(a.purpose_file, a.lot)
+    except OSError as e:
+        ap.error(f"--purpose-file: {e}")
+    n = record_round(a.lot, findings)
+    steps = [
+        "Fix them in NEW commits (no amend)." + (" Contract changes go on the contract branch first, then merge it back." if a.contract_first else ""),
+        f"Scratch files only under {scratch}/, with names only this lot uses.",
+        "Targeted tests through ~/.claude/iphtah-kit/bin/run-queued (never a full suite yourself).",
+        f"Then the full build: {full_build_line(a.client, repo, branch)}",
+    ]
+    if a.front:
+        steps.append("Then the phone e2e (360, 390, 768, 1280) on a quiet machine, AFTER the last edit, and look at the screenshots.")
+    steps += [
+        "Then ~/.claude/iphtah-kit/bin/verify-lot on the worktree.",
+        "Each guard you add gets a negative control; name any mutant that survives or is equivalent.",
+        "For each finding, write as tests one case it must refuse and one case it must allow, so the next round cannot undo this one without a red test.",
+        f"purpose.md and fix-rounds.jsonl (under {P.lot_dir(a.lot)}/) are not yours to edit; if the purpose is wrong, say so in your report.",
+        "Report: the sha, the merge-check GREEN line, what you changed per point, what you challenged. No push, no post.",
+    ]
+    if n is not None and n >= 3:
+        print(f"ROUND {n} on this lot: stop patching. Rethink the design against the Purpose: what is it for, what is it not for? "
+              "Propose the design change first, with evidence, before code.\n")
+    if purpose is None:
+        print(P.PLACEHOLDER + "\n")
+    print(f"LOT: {a.lot}. The review's findings:\n\n{findings}\n")
+    if purpose is not None:
+        print(f"**Purpose** (what this is for, what it stops, what it must never block):\n\n{purpose}\n")
+    print("\n".join(f"- {s}" for s in steps))
+
+if __name__ == "__main__":
+    main()

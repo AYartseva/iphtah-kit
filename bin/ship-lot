@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""ship-lot — the tail of a lot, from a clean review to the open pull request and the lot recorded done in the ledger, in one command.
+
+    ship-lot --client C <lot-id> <worktree> --base <branch> --title "<PR title>" --body <file> [--marker '<string>']... [--containers-ok] [--proof DIR | --no-ui-proof "<why>"] [--draft] --approved
+"""
+import argparse
+import datetime as dt
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def run(cmd, cwd=None, check=True):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.exit(f"ship-lot: {' '.join(cmd[:3])}… failed:\n{p.stdout[-800:]}{p.stderr[-800:]}")
+    return p.stdout.strip()
+
+
+def repo_of(client, wt):
+    url = run(["git", "remote", "get-url", "origin"], cwd=wt)
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
+    proj = json.load(open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")))
+    for name, r in proj["repos"].items():
+        if m and r.get("github", "").lower() == m.group(1).lower():
+            return name, r
+    sys.exit(f"ship-lot: {url} is not a repository of client {client}")
+
+
+def push_gate_module():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("push_gate", os.path.join(HERE, "push-gate")).load_module()
+
+
+def done_refusal(wt, name, head, branch):
+    ""
+    gate = push_gate_module()
+    repo = gate.which_repo(wt)
+    if repo is None:
+        return None
+    removed, refusal = gate.floor_removed(repo["bypass_env"])
+    if refusal:
+        return refusal
+    return gate.done_refusal(name, repo["state_dir"], head, branch, repo["bypass_env"], removed is None)
+
+
+def push(branch, wt, head):
+    ""
+    run(["git", "push", "-u", "origin", f"{head}:refs/heads/{branch}"], cwd=wt)
+    subprocess.run(["git", "-C", wt, "worktree", "unlock", wt], capture_output=True)
+
+
+def wrong_base(state_dir, name, head, base):
+    ""
+    gate = push_gate_module()
+    path = os.path.join(os.path.expanduser(state_dir), "green-builds")
+    stamps = ""
+    if os.path.exists(path):
+        with open(path) as fh:
+            stamps = fh.read()
+    bases = gate.stamped_bases(stamps, name, head)
+    if base in bases:
+        return None
+    return (f"ship-lot: {name} {head[:8]} is green against {', '.join(sorted(set(bases))) or 'nothing'}, not against "
+            f"the PR's base {base}. Run first: merge-check {name} <branch> --local --base {base}")
+
+
+DEPLOY_LINE = re.compile(r"^[\s*_>-]*deploy(?:\s+order)?[*_]*\s*:[*_]*\s*(.*)$", re.I)
+PR_REF = re.compile(r"(?:^|(?<=[\s(\[]))(?:([\w.-]+/[\w.-]+))?#([1-9]\d*)\b"
+                    r"|github\.com/([\w.-]+/[\w.-]+)/pull/([1-9]\d*)\b")
+DEPLOY_FIRST = re.compile(r"first(?:\s+[—–-]\s+.*)?", re.I)
+GH_MISSING = re.compile(r"Could not resolve to a (PullRequest|Repository)|no pull requests? found", re.I)
+
+
+def deploy_rules(repo):
+    ""
+    return [(e["path"], e.get("lines")) if isinstance(e, dict) else (e, None)
+            for e in repo.get("deploy_order_paths") or []]
+
+
+def touched_deploy_paths(wt, base_ref, rules):
+    ""
+    def git(*args):
+        return subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=wt, capture_output=True, text=True,
+                              check=True).stdout
+    rng = f"{base_ref}...HEAD"
+    changed = [f for f in git("diff", "--no-renames", "--name-only", rng).splitlines() if f]
+    hits = []
+    for f in changed:
+        for pattern, lines in rules:
+            if not (f == pattern or fnmatch.fnmatchcase(f, pattern)):
+                continue
+            if lines is None:
+                hits.append(f)
+            else:
+                diff = git("diff", "--no-renames", "-U0", rng, "--", f).splitlines()
+                body = diff[next((i for i, l in enumerate(diff) if l.startswith("@@")), len(diff)):]
+                if any(l.startswith(("+", "-")) and lines in l for l in body):
+                    hits.append(f"{f} ({lines} lines)")
+            break
+    return hits
+
+
+def deploy_first(body):
+    ""
+    for line in body.splitlines():
+        m = DEPLOY_LINE.match(line.strip())
+        if m and DEPLOY_FIRST.fullmatch(m.group(1).strip()):
+            return True
+    return False
+
+
+def deploy_refs(body, github):
+    ""
+    refs = []
+    for line in body.splitlines():
+        m = DEPLOY_LINE.match(line.strip())
+        if m and not DEPLOY_FIRST.fullmatch(m.group(1).strip()):
+            for r in PR_REF.finditer(m.group(1)):
+                repo, n = (r.group(1), r.group(2)) if r.group(2) else (r.group(3), r.group(4))
+                refs.append((repo or github, int(n)))
+    return refs
+
+
+def pr_state(github, n):
+    ""
+    if not github:
+        return "unchecked"
+    try:
+        p = subprocess.run(["gh", "pr", "view", str(n), "-R", github, "--json", "number"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unchecked"
+    if p.returncode == 0:
+        try:
+            return "ok" if json.loads(p.stdout).get("number") == n else "unchecked"
+        except (ValueError, AttributeError):
+            return "unchecked"
+    return "missing" if GH_MISSING.search(p.stderr + p.stdout) else "unchecked"
+
+
+def deploy_gate(wt, base, repo, body):
+    ""
+    rules = deploy_rules(repo)
+    if not rules:
+        return None
+    ok = lambda *c: subprocess.run(["git", *c], cwd=wt, capture_output=True).returncode == 0
+    ref = next((r for r in (f"origin/{base}", base) if ok("rev-parse", "--verify", "-q", r + "^{commit}")), None)
+    unreadable = (f"ship-lot: cannot read the diff against {base} to check the deploy order "
+                  f"(deploy_order_paths is set); fetch the base and run again")
+    if ref is None:
+        return unreadable
+    try:
+        hits = touched_deploy_paths(wt, ref, rules)
+    except subprocess.CalledProcessError:
+        return unreadable
+    if not hits:
+        return None
+    where = "the diff touches a deploy-order path (" + ", ".join(hits) + ")"
+    refs = deploy_refs(body, repo.get("github"))
+    if not refs:
+        if deploy_first(body):
+            return None
+        return (f"ship-lot: {where}; the PR body needs a line naming the PR that must go out before it, "
+                "« Deploy: after #<PR> » (owner/repo#n or the PR link; « TBD », « #000 » or « after X » are not one), "
+                "or exactly « Deploy: first » when this PR goes out first (« Deploy: first — <what follows it> »); "
+                "a switch goes on its own « Switch: » line")
+    states = {(g, n): pr_state(g, n) for g, n in refs}
+    missing = [f"{g}#{n}" for (g, n), st in states.items() if st == "missing"]
+    if missing:
+        return f"ship-lot: {where}; its « Deploy: » line names no existing PR: {', '.join(missing)}"
+    unchecked = [f"{g or '?'}#{n}" for (g, n), st in states.items() if st != "ok"]
+    if unchecked:
+        return f"ship-lot: {where}; could not check {', '.join(unchecked)} on GitHub, retry"
+    return None
+
+
+def proof_args(a):
+    ""
+    return ((["--proof", a.proof] if a.proof else [])
+            + (["--no-ui-proof", a.no_ui_proof] if a.no_ui_proof else []))
+
+
+def verify_cmd(wt, a):
+    return [f"{HERE}/verify-lot", wt, "--lot", a.lot] + proof_args(a)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--client", required=True)
+    ap.add_argument("lot")
+    ap.add_argument("worktree")
+    ap.add_argument("--base", required=True, help="the PR's base branch (a round branch when stacked)")
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--body", required=True, help="the PR body file")
+    ap.add_argument("--marker", action="append", default=[])
+    ap.add_argument("--containers-ok", action="store_true")
+    go = ap.add_mutually_exclusive_group()
+    go.add_argument("--approved", action="store_true")
+    proof = ap.add_mutually_exclusive_group()
+    proof.add_argument("--proof", metavar="DIR", help="screenshots taken for this change (verify-lot --proof)")
+    proof.add_argument("--no-ui-proof", metavar="WHY", help="why this lot needs no screen proof (verify-lot)")
+    ap.add_argument("--draft", action="store_true")
+    a = ap.parse_args()
+    a.title = re.sub(r"^(#+\s*|Title:\s*)", "", a.title.strip())
+    if not os.path.isfile(a.body):
+        sys.exit(f"ship-lot: no body file {a.body}")
+    wt = os.path.realpath(a.worktree)
+    name, repo = repo_of(a.client, wt)
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=wt)
+    head = run(["git", "rev-parse", "HEAD"], cwd=wt)
+    if branch == "HEAD" or branch in repo.get("protected", []):
+        sys.exit(f"ship-lot: refused — {branch} is detached or protected")
+
+    report = run(verify_cmd(wt, a), check=False)
+    if not re.search(r"verdict:\s+OK", report):
+        only_containers = all(
+            ("containers:" in l) for l in report.splitlines()
+            if re.search(r"^\s+(tree|strays|containers):", l) and not re.search(r"clean|none", l))
+        if not (a.containers_ok and only_containers and re.search(r"green:\s+\S+ " + head, report)):
+            sys.exit("ship-lot: verify-lot is not OK:\n" + report)
+
+    with open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")) as fh:
+        proj = json.load(fh)
+    why = wrong_base(proj["state_dir"], name, head, a.base) or done_refusal(wt, name, head, branch)
+    if why:
+        sys.exit(why)
+
+    run(["git", "fetch", "-q", "origin", repo["base"]], cwd=wt)
+    for m in a.marker:
+        live = subprocess.run(["git", "grep", "-q", "-F", m, f"origin/{repo['base']}"], cwd=wt).returncode == 0
+        here = subprocess.run(["git", "grep", "-q", "-F", m, "HEAD"], cwd=wt).returncode == 0
+        if live or not here:
+            sys.exit(f"ship-lot: marker {m!r} is {'already in the live base' if live else 'not in HEAD'}")
+
+    subprocess.run(["git", "fetch", "-q", "origin", a.base], cwd=wt, capture_output=True)
+    with open(a.body) as fh:
+        why = deploy_gate(wt, a.base, repo, fh.read())
+    if why:
+        sys.exit(why)
+
+    plan = [f"push {branch} @ {head[:8]} to {repo['github']}",
+            f"open a {'draft ' if a.draft else ''}PR {branch} → {a.base}: {a.title}"]
+    plan += [f"lots done {a.lot}"]
+    if not a.approved:
+        auto, why = False, None
+        if not auto:
+            print(f"ship-lot: checks OK. Plan (nothing done — {why + '; ' if why else ''}"
+                  "add --approved once the person said so):")
+            print("\n".join("  - " + p for p in plan))
+            sys.exit(1)
+        print(f"ship-lot: checks OK; pushing without a per-batch go: {why}")
+
+    push(branch, wt, head)
+    pr = run(["gh", "pr", "create", "-R", repo["github"], "--base", a.base, "--head", branch,
+              "--title", a.title, "--body-file", a.body] + (["--draft"] if a.draft else []), cwd=wt).splitlines()[-1]
+    print(f"PR: {pr}")
+    lot_done = subprocess.run([f"{HERE}/lots", "--client", a.client, "done", a.lot, "--worktree", wt, "--base", a.base],
+                              capture_output=True, text=True)
+    print((lot_done.stdout.strip().splitlines() or [f"lots done {a.lot}: no answer (is the lot in the ledger?)"])[-1])
+    sys.exit(0 if lot_done.returncode == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

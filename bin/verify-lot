@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""verify-lot <worktree> [--client C] [--lot ID --agent AGENT_ID]
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STRAYS = re.compile(r"^(docs/PLAN_|memory/)")
+UI_FILE = re.compile(r"\.(tsx|jsx|css|scss|html|vue|svelte)$")
+MIGRATION = re.compile(r"(db/[\w-]*migrations?/(?:[^/]+/)?V\d+__[^/]+\.sql|migrations/\d{4}_[^/]+\.sql)$")
+KEEP_CONTAINERS = ()
+NODE_TESTS = ("vitest", "jest", "playwright")
+
+
+def can_own_containers(cmd):
+    ""
+    argv = cmd.split()
+    prog = argv[0].rsplit("/", 1)[-1] if argv else ""
+    if prog == "java":
+        return True
+    script = argv[1] if len(argv) > 1 else ""
+    return prog == "node" and any(t in script for t in NODE_TESTS)
+
+
+def build_processes():
+    ""
+    out = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline") as f:
+                cmd = f.read().replace("\0", " ").strip()
+            if can_own_containers(cmd):
+                out.append((os.path.realpath(f"/proc/{pid}/cwd"), cmd))
+        except OSError:
+            pass
+    return out
+
+
+def lot_containers(wt, names, procs):
+    ""
+    names = [n for n in names if n and not n.startswith(KEEP_CONTAINERS)]
+    wt = os.path.realpath(wt)
+    mine = any(c == wt or c.startswith(wt + os.sep) for c, _ in procs)
+    if mine or not procs:
+        return names, []
+    return [], names
+
+
+def sh(args, cwd=None):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def client_for(path, client):
+    clients = [client] if client else [os.path.basename(d) for d in
+                                       sorted(os.listdir(os.path.expanduser("~/.claude/iphtah-kit/clients")))]
+    remote = sh(["git", "remote", "get-url", "origin"], cwd=path)
+    for c in clients:
+        pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{c}/project.json")
+        if not os.path.exists(pj):
+            continue
+        cfg = json.load(open(pj))
+        for name, r in cfg.get("repos", {}).items():
+            if r.get("github") and r["github"] in remote:
+                return c, cfg, name, r
+    sys.exit(f"no client's project.json names the repository of {path} ({remote})")
+
+
+PHONE_CHECK = "phone-check"
+PHONE_ABSENT = (" (phone-check is the kit developers' screenshot tool, not in this kit: shoot with a tool that "
+                "writes phone-check.json, or pass --no-ui-proof \"<why>\")")
+MANIFEST = "phone-check.json"
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def shots_proof(proof_dir, head, wt):
+    ""
+    rerun = f"rerun {PHONE_CHECK} --out {proof_dir} on the final commit and look at the screenshots{PHONE_ABSENT}"
+    if not head:
+        return False, "UNPROVEN: no HEAD commit to compare the screenshots with"
+    if not os.path.isdir(proof_dir):
+        return False, f"NONE: {proof_dir} is not a directory"
+    try:
+        with open(os.path.join(proof_dir, MANIFEST)) as f:
+            runs = json.load(f).get("runs")
+    except FileNotFoundError:
+        return False, f"UNPROVEN: no {MANIFEST} in {proof_dir} (shots by hand or an older phone-check): {rerun}"
+    except (OSError, ValueError, AttributeError):
+        return False, f"UNPROVEN: {MANIFEST} in {proof_dir} is unreadable: {rerun}"
+    if not isinstance(runs, list) or not runs:
+        return False, f"UNPROVEN: {MANIFEST} in {proof_dir} lists no run: {rerun}"
+    count = 0
+    for r in runs:
+        sha, shots = (r.get("sha"), r.get("shots")) if isinstance(r, dict) else (None, None)
+        what = r.get("target", "?") if isinstance(r, dict) else "?"
+        if not isinstance(shots, dict) or not shots:
+            return False, f"UNPROVEN: a run of {what} lists no screenshot: {rerun}"
+        repo = r.get("repo")
+        if sha and (not isinstance(repo, str) or os.path.realpath(repo) != os.path.realpath(wt)):
+            if sha == head:
+                return False, (f"ELSEWHERE: {what} was shot from {repo}, not from this worktree {wt}: rerun "
+                               f"{PHONE_CHECK} --repo {wt} --out {proof_dir}{PHONE_ABSENT}")
+            return False, (f"ELSEWHERE: {MANIFEST} holds a run of {what} from another checkout ({repo}, at "
+                           f"{str(sha)[:8]}), another lot's in a shared --out? Shoot this lot into a fresh --out, "
+                           f"with --repo {wt} for a URL")
+        if sha != head:
+            return False, (f"STALE: {what} was shot on {str(sha)[:8] if sha else 'no commit'}, "
+                           f"HEAD is {head[:8]}: {rerun}")
+        if r.get("dirty") is not False:
+            how = ("with uncommitted changes" if r.get("dirty")
+                   else "on a tree of unknown state (outside a repository, or the commit moved during the run)")
+            return False, f"STALE: {what} was shot on {head[:8]} {how}: {rerun}"
+        for name, digest in shots.items():
+            path = os.path.join(proof_dir, os.path.basename(name))
+            if not os.path.isfile(path):
+                return False, f"UNPROVEN: {name} is listed but missing: {rerun}"
+            try:
+                same = _sha256(path) == digest
+            except OSError as e:
+                return False, f"UNPROVEN: {name} could not be read ({e.strerror}): {rerun}"
+            if not same:
+                return False, f"UNPROVEN: {name} is not the picture phone-check took: {rerun}"
+            count += 1
+        if r.get("ok") is not True:
+            widths = r.get("widths")
+            widths = ",".join(str(w) for w in widths) if isinstance(widths, list) and widths else "?"
+            return False, (f"FAILED: phone-check failed on {what} (widths {widths}): fix the page, then rerun "
+                           f"{PHONE_CHECK} --out {proof_dir} and look at the screenshots{PHONE_ABSENT}")
+    return True, f"fresh ({count} screenshot(s) shot by phone-check on HEAD {head[:8]}, clean tree, passed)"
+
+
+def ui_proof(wt, ui_files, proof_dir=None, waived=None, head=None):
+    ""
+    if not ui_files:
+        return True, "n/a (no screen file changed)"
+    if waived:
+        return True, f"waived: {waived}"
+    if proof_dir:
+        return shots_proof(proof_dir, head or "", wt)
+    edits = [os.path.getmtime(os.path.join(wt, f)) for f in ui_files if os.path.exists(os.path.join(wt, f))]
+    last_edit = max(edits) if edits else 0
+    runs = []
+    pw = os.path.join(wt, "test-results", ".last-run.json")
+    if os.path.exists(pw):
+        try:
+            status = json.load(open(pw)).get("status")
+        except (OSError, ValueError):
+            status = "unreadable"
+        runs.append(("browser run", os.path.getmtime(pw), status))
+    if not runs:
+        return False, (f"NONE for {len(ui_files)} changed screen file(s): run {PHONE_CHECK} / the responsive "
+                       f"spec, or --no-ui-proof \"<why>\"{PHONE_ABSENT}")
+    fresh = [r for r in runs if r[1] >= last_edit and r[2] == "passed"]
+    if fresh:
+        return True, f"fresh ({fresh[0][0]}, passed, after the last screen edit)"
+    worst = runs[0]
+    why = "older than the last screen edit" if worst[1] < last_edit else f"status {worst[2]}"
+    return False, f"STALE: {worst[0]} {why} — rerun it on the final code and look at the screenshots"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("worktree")
+    ap.add_argument("--client")
+    ap.add_argument("--lot")
+    ap.add_argument("--agent")
+    ap.add_argument("--proof", help="a directory of screenshots taken for this change")
+    ap.add_argument("--no-ui-proof", metavar="WHY")
+    a = ap.parse_args()
+    wt = os.path.expanduser(a.worktree)
+    c, cfg, repo_name, repo = client_for(wt, a.client)
+    base = repo.get("base", "main")
+    sh(["git", "fetch", "-q", "origin", base], cwd=wt)
+    head = sh(["git", "rev-parse", "HEAD"], cwd=wt)
+    subject = sh(["git", "log", "-1", "--format=%s"], cwd=wt)
+    branch = sh(["git", "branch", "--show-current"], cwd=wt) or "(detached)"
+    status = sh(["git", "status", "--porcelain"], cwd=wt).splitlines()
+    tracked = [l for l in status if not l.startswith("??")]
+    untracked = [l[3:] for l in status if l.startswith("??")]
+    green_file = os.path.join(os.path.expanduser(cfg["state_dir"]), "green-builds")
+    greens = [l for l in open(green_file).read().splitlines() if head in l] if os.path.exists(green_file) else []
+    changed = sh(["git", "diff", "--name-only", f"origin/{base}...HEAD"], cwd=wt).splitlines()
+    strays = [f for f in changed if STRAYS.match(f)]
+    migrations = [f for f in changed if MIGRATION.search(f)]
+    containers, other_containers = lot_containers(
+        wt, sh(["docker", "ps", "--format", "{{.Names}}"]).splitlines(), build_processes())
+    ui_ok, ui_line = ui_proof(wt, [f for f in changed if UI_FILE.search(f) and "/test" not in f
+                                   and ".test." not in f and ".spec." not in f], a.proof, a.no_ui_proof, head)
+    ok = not tracked and greens and not strays and not containers and ui_ok
+    print(f"{c} / {repo_name} — {branch} @ {head[:8]}  {subject}")
+    print(f"  tree:        {'clean' if not tracked else f'{len(tracked)} uncommitted change(s)'}"
+          f"{f' ({len(untracked)} untracked)' if untracked else ''}")
+    print(f"  green:       {greens[-1] if greens else 'NO green record for this commit'}")
+    print(f"  strays:      {', '.join(strays) if strays else 'none'}")
+    print(f"  migrations:  {', '.join(os.path.basename(m) for m in migrations) if migrations else 'none'}")
+    print(f"  containers:  {', '.join(containers) if containers else 'none left'}"
+          f"{f' (other builds containers, ignored: {len(other_containers)})' if other_containers else ''}")
+    print(f"  phone proof: {ui_line}")
+    for tool, label in (("migration-lint", "sql lint:"), ("save-check", "save check:"),
+                        ("two-sources-lint", "two sources:")):
+        try:
+            r = subprocess.run([os.path.join(HERE, tool), wt, "--base", f"origin/{base}"]
+                               + (["--client", c] if tool == "two-sources-lint" else []),
+                               capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            print(f"  {label:<13}timed out (120 s)")
+            continue
+        lines = [l for l in r.stdout.splitlines() if l.startswith(("ERROR", "warn", "allowed"))]
+        if r.returncode >= 2:
+            lines.append(f"{tool} failed: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
+        print(f"  {label:<13}{'none' if not lines else f'{len(lines)} finding(s)'}")
+        for l in lines:
+            print(f"    {l}")
+    if a.lot and a.agent:
+        subprocess.run([os.path.join(HERE, "lots"), "--client", c, "agents", a.lot, a.agent], check=False)
+        print(f"  lot:         agent {a.agent} attached to {a.lot}")
+    print("  verdict:     " + ("OK" if ok else "NOT READY"))
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

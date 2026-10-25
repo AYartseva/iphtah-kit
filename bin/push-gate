@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""push-gate — Claude Code PreToolUse hook (Bash): no push of an unverified commit.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+from importlib.machinery import SourceFileLoader
+
+_project = SourceFileLoader("iphtah_project", os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "iphtah-project")).load_module()
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _done
+
+
+def _log(*args, **kw):
+    ""
+    try:
+        import _safelog
+        _safelog.log(*args, **kw)
+    except BaseException:
+        pass
+
+
+try:
+    BYPASS_VARS = {"IPHTAH_PUSH_UNCHECKED"} | {
+        cfg.get("bypass_env", "IPHTAH_PUSH_UNCHECKED") for cfg in _project.load().values()}
+except Exception:
+    BYPASS_VARS = {"IPHTAH_PUSH_UNCHECKED"}
+
+
+
+def protected_of(repo):
+    ""
+    protected = repo.get("protected")
+    return [repo["base"]] if protected is None else list(protected)
+
+def deny(reason, code="refused", rule="push_gate"):
+    ""
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "push-gate: " + reason,
+    }}))
+    _log("push-gate", "refuse", ["git_push", code], code, rule)
+    sys.exit(0)
+
+
+NOTICES = []
+
+
+def warn(msg):
+    ""
+    print(json.dumps({"systemMessage": "\n".join(list(dict.fromkeys(NOTICES)) + ["push-gate: " + msg])}))
+    sys.exit(0)
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True).stdout.strip()
+
+
+def which_repo(cwd):
+    common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return None
+    top = os.path.realpath(os.path.dirname(common))
+    return _project.where(top)
+
+
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def without_heredocs(command):
+    ""
+    out, lines, i = [], command.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        markers = [m.group(2) for m in _HEREDOC.finditer(line)]
+        i += 1
+        for marker in markers:
+            while i < len(lines) and lines[i].strip() != marker:
+                i += 1
+            i += 1
+    return " ; ".join(out)
+
+
+def words(command):
+    ""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    raw = list(lexer)
+    out, i = [], 0
+    while i < len(raw):
+        t = raw[i]
+        if set(t) <= set("<>&") and ("<" in t or ">" in t):
+            if out and out[-1].isdigit():
+                out.pop()
+            i += 2
+            continue
+        if t in ("(", ")"):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def pushes(command, start_cwd):
+    ""
+    cwd = start_cwd
+    try:
+        tokens = words(without_heredocs(command))
+    except ValueError:
+        return None
+    seg, segs = [], []
+    for t in tokens:
+        if t in ("&&", "||", ";", "|"):
+            segs.append(seg); seg = []
+        else:
+            seg.append(t)
+    segs.append(seg)
+    found = []
+    for s in segs:
+        env_bypass = None
+        while s and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s[0]):
+            if s[0].endswith("=1") and s[0][:-2] in BYPASS_VARS:
+                env_bypass = s[0][:-2]
+            s = s[1:]
+        if not s:
+            continue
+        if s[0] == "cd" and len(s) > 1:
+            cwd = os.path.join(cwd, os.path.expanduser(s[1]))
+            continue
+        if s[0] != "git":
+            continue
+        i, here = 1, cwd
+        while i < len(s) and s[i].startswith("-"):
+            if s[i] == "-C" and i + 1 < len(s):
+                here = os.path.join(cwd, os.path.expanduser(s[i + 1])); i += 2
+            elif s[i] in ("-c",) and i + 1 < len(s):
+                i += 2
+            else:
+                i += 1
+        if i < len(s) and s[i] == "push":
+            found.append((here, s[i + 1:], env_bypass))
+    return found
+
+
+def stamped_bases(stamps, name, sha):
+    ""
+    out = []
+    for line in stamps.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == name and parts[1] == sha:
+            out.append(parts[2])
+    return out
+
+
+CALL_S = 6.0
+BUDGET_S = 12.0
+
+
+def budget():
+    try:
+        return min(BUDGET_S, max(0.0, float(os.environ.get("IPHTAH_PUSH_GATE_BUDGET", BUDGET_S))))
+    except ValueError:
+        return BUDGET_S
+
+
+_deadline = [None]
+
+
+def _left():
+    ""
+    if _deadline[0] is None:
+        _deadline[0] = time.monotonic() + budget()
+    left = min(CALL_S, _deadline[0] - time.monotonic())
+    return left if left > 0.05 else None
+
+
+def _ask(cmd, cwd):
+    left = _left()
+    if left is None:
+        return None
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=left)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def pr_base_of(cwd, github, branch):
+    ""
+    cmd = ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "baseRefName,isCrossRepository",
+           "--jq", ".[] | select(.isCrossRepository | not) | .baseRefName"] + (["-R", github] if github else [])
+    r = _ask(cmd, cwd)
+    if r is None:
+        return None
+    if r.returncode != 0:
+        return None
+    names = sorted(set(r.stdout.split()))
+    return names[0] if len(names) == 1 else (None if names else "")
+
+
+def on_origin(cwd, branch):
+    ""
+    r = _ask(["git", "-C", cwd, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}"], cwd)
+    if r is None:
+        return None
+    return True if r.returncode == 0 else (False if r.returncode == 2 else None)
+
+
+def base_refusal(name, sha, dst, bases, pr_base, exists, bypass="IPHTAH_PUSH_UNCHECKED"):
+    ""
+    why = _base_refusal(name, sha, dst, bases, pr_base, exists)
+    return why and why + f" A push approved as unchecked: prefix {bypass}=1."
+
+
+def _base_refusal(name, sha, dst, bases, pr_base, exists):
+    pr = pr_base()
+    rerun = f"merge-check {name} {dst} --local"
+    if pr is None:
+        return (f"cannot tell the base of {dst}'s PR (GitHub unreachable or too slow, or open PRs on several bases) — the green record "
+                f"of {sha[:8]} is on {', '.join(sorted(set(bases)))}. Retry when GitHub answers.")
+    if pr:
+        if pr in bases:
+            return None
+        return (f"{name} commit {sha[:8]} is green against {', '.join(sorted(set(bases)))}, but {dst}'s PR targets "
+                f"{pr}. Run first: {rerun} (it takes the PR's base) — then push.")
+    for b in bases:
+        if exists(b) is True:
+            return None
+    return (f"{name} commit {sha[:8]} is green against {', '.join(sorted(set(bases)))}, which is not a branch on "
+            f"origin (or origin could not be asked in time). Run first: {rerun} --base <the branch it sits on, pushed> — "
+            f"then push.")
+
+
+def floor_removed(bypass="IPHTAH_PUSH_UNCHECKED"):
+    ""
+    try:
+        return _done.floor_why(), None
+    except _done.DoneError as e:
+        return None, f"{e}. A push approved as unchecked: prefix {bypass}=1."
+
+
+def removal_notice(name, why):
+    ""
+    return f"push-gate: {name} goes without merge-check, as done.json decides: {why}"
+
+
+def done_refusal(name, state_dir, sha, branch, bypass, floor=True):
+    ""
+    try:
+        miss = _done.missing(state_dir, name, sha)
+    except _done.DoneError as e:
+        return f"{e}. A push approved as unchecked: prefix {bypass}=1."
+    if not miss:
+        return None
+    asks = (f"is green on merge-check, but {_done.DONE} also asks for" if floor else
+            f"goes without merge-check, as {_done.DONE} decides with its why, and that file asks for")
+    return (f"{name} commit {sha[:8]} {asks} {', '.join(miss)}, with no green record of "
+            f"{'it' if len(miss) == 1 else 'them'} for this commit. Run "
+            f"first, in the repository with {branch} checked out and a clean tree: done-check — then push. A push "
+            f"approved as unchecked: prefix {bypass}=1.")
+
+
+def main():
+    data = json.load(sys.stdin)
+    command = (data.get("tool_input") or {}).get("command", "")
+    if "push" not in command or "git" not in command:
+        sys.exit(0)
+    found = pushes(command, data.get("cwd") or os.getcwd())
+    if found is None:
+        warn("could not parse this command; push NOT checked.")
+    if not found:
+        sys.exit(0)
+    notices = NOTICES
+    for cwd, args, bypass in found:
+        repo = which_repo(cwd)
+        if repo is None:
+            continue
+        name, protected = repo["repo"], protected_of(repo)
+        stamps_path = os.path.join(repo["state_dir"], "green-builds")
+        stamps = ""
+        if os.path.exists(stamps_path):
+            with open(stamps_path) as fh:
+                stamps = fh.read()
+        if bypass == repo["bypass_env"] or bypass == "IPHTAH_PUSH_UNCHECKED" \
+                or "--dry-run" in args or "-n" in args or "--delete" in args or "-d" in args:
+            continue
+        positional = [a for a in args if not a.startswith("-")]
+        refspecs = positional[1:]
+        if not refspecs:
+            branch = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+            if not branch:
+                warn("detached HEAD and no refspec; push NOT checked.")
+            refspecs = [branch]
+        for spec in refspecs:
+            src, _, dst = spec.lstrip("+").partition(":")
+            if not src:
+                continue
+            dst = dst or src
+            dst = dst.removeprefix("refs/heads/")
+            if dst in protected:
+                deny(f"direct push to {dst} in {name} — one branch per theme, merged through a PR.",
+                     "protected_branch", "no_direct_push_to_protected")
+            if repo.get("gate") is False:
+                continue
+            sha = git(cwd, "rev-parse", "--verify", "-q", src + "^{commit}")
+            if not sha:
+                warn(f"cannot resolve '{src}' in {cwd}; push NOT checked.")
+            removed, refusal = floor_removed(repo["bypass_env"])
+            if refusal:
+                deny(refusal, "done_check_missing", "definition_of_done")
+            floor = removed is None
+            bases = stamped_bases(stamps, name, sha)
+            if floor and not bases:
+                branch_name = src if not re.fullmatch(r"[0-9a-f]{7,40}", src) else "<branch>"
+                deny(f"{name} commit {sha[:8]} ({src}) has no green merge-check. "
+                     f"Run first: merge-check {name} {branch_name} --local"
+                     + (" --burst" if repo.get("burst") else "")
+                     + f" — then push. A push approved as unchecked: prefix {repo['bypass_env']}=1.",
+                     "no_green_merge_check", "green_merge_check_required")
+            refusal = done_refusal(name, repo["state_dir"], sha, src, repo["bypass_env"], floor)
+            if refusal:
+                deny(refusal, "done_check_missing", "definition_of_done")
+            refusal = floor and base_refusal(name, sha, dst, bases, lambda: pr_base_of(cwd, repo.get("github"), dst),
+                                             lambda b: on_origin(cwd, b), repo["bypass_env"])
+            if refusal:
+                deny(refusal, "green_on_other_base", "green_merge_check_on_pr_base")
+            if not floor:
+                notices.append(removal_notice(name, removed))
+    if notices:
+        print(json.dumps({"systemMessage": "\n".join(dict.fromkeys(notices))}))
+    sys.exit(0)
+
+
+ZERO_SHA = re.compile(r"0+")
+
+
+def pre_push_refusal(cwd, ref_lines, env):
+    ""
+    judged = pre_push_judge(cwd, ref_lines, env)
+    return judged and judged[0]
+
+
+def pre_push_judge(cwd, ref_lines, env, notices=None):
+    ""
+    repo = which_repo(cwd)
+    if repo is None or repo.get("gate") is False:
+        return None
+    if env.get(repo["bypass_env"]) == "1" or env.get("IPHTAH_PUSH_UNCHECKED") == "1":
+        return None
+    name = repo["repo"]
+    stamps_path = os.path.join(repo["state_dir"], "green-builds")
+    stamps = ""
+    if os.path.exists(stamps_path):
+        with open(stamps_path) as fh:
+            stamps = fh.read()
+    for line in ref_lines:
+        parts = line.split()
+        if len(parts) < 4 or ZERO_SHA.fullmatch(parts[1]):
+            continue
+        local_ref, local_sha, remote_ref = parts[0], parts[1], parts[2]
+        sha = git(cwd, "rev-parse", "--verify", "-q", local_sha + "^{commit}")
+        if not sha:
+            continue
+        removed, refusal = floor_removed(repo["bypass_env"])
+        if refusal:
+            return refusal, "done_check_missing", "definition_of_done_at_push_time"
+        floor = removed is None
+        if floor and not stamped_bases(stamps, name, sha):
+            branch = local_ref.removeprefix("refs/heads/")
+            return (f"{name} commit {sha[:8]} ({local_ref} -> {remote_ref}) has no green merge-check record, judged "
+                    f"at push time. Run first: merge-check {name} {branch} --local — then push. A push approved "
+                    f"as unchecked: prefix {repo['bypass_env']}=1.",
+                    "no_green_merge_check", "green_merge_check_at_push_time")
+        refusal = done_refusal(name, repo["state_dir"], sha, local_ref.removeprefix("refs/heads/"), repo["bypass_env"],
+                               floor)
+        if refusal:
+            return refusal, "done_check_missing", "definition_of_done_at_push_time"
+        if not floor and notices is not None:
+            notices.append(removal_notice(name, removed))
+    return None
+
+
+def pre_push_main(argv):
+    ""
+    notices = []
+    try:
+        judged = pre_push_judge(os.getcwd(), sys.stdin.read().splitlines(), os.environ, notices)
+    except Exception as e:
+        print(f"push-gate (pre-push): could not judge this push ({type(e).__name__}); push NOT checked.",
+              file=sys.stderr)
+        return 0
+    if judged is None:
+        for line in dict.fromkeys(notices):
+            print(line, file=sys.stderr)
+        return 0
+    why, code, rule = judged
+    print("push-gate (pre-push): " + why, file=sys.stderr)
+    _log("push-gate", "refuse", ["git_pre_push", code], code, rule)
+    return 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--pre-push"]:
+        sys.exit(pre_push_main(sys.argv[2:]))
+    main()

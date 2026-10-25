@@ -1,0 +1,65 @@
+LOT: $lot
+$title  (class $cls, type $type)
+$money
+## Goal
+<the session writes the context the code can't tell, one line each (QQOQCCP), and leaves out a line the code tells:
+- Qui: who asked, who uses the result, who decides
+- Quoi: what this lot delivers
+- Où: where it runs and where it lands (repo, files, machine)
+- Quand: when it is used, and by when it is needed
+- Comment: only where the code can't tell it; more steps for a smaller model
+- Combien: its size, its budget, the scale it must hold
+- Pourquoi: the Purpose below>
+$map
+## Purpose
+<the session writes it in $purpose before the first agent starts: what this is for, what it protects against (an
+accident or an adversary), what it must NEVER block. Paste it here; fix and re-review briefs read that file.>
+
+## Definition of done: what it must not do (fixed; answer each line with a test, or « n/a: why »)
+<the builder writes, before the first commit, one line per item: the bad case for this lot and what must happen>
+1. Coexistence: an interruption, network latency, a second click, a retry, two runs in parallel → no corrupted state,
+   no panic, no double effect, no lost write.
+2. Proof: each guard has a test that is red when the guard is cut; no test that cannot fail.
+3. Claims: no text (comment, report, message, doc) says more than what runs; « will » for what doesn't run yet.
+4. The three hostile worlds: an empty payload (null, []), a monstrous one, and a failure upstream → each proven by a
+   test. The happy path counts for one third of the grade.
+5. The other side: one source per fact; the caller and the callee agree (names, units, statuses).
+6. Every state: loading, empty, error, a long text, a small screen → each says something true.
+7. Rights and side effects: nobody sees or does what their role doesn't allow, one client's or instance's data stays
+   its own, and nothing writes or sends what it wasn't asked to, including through what it loads or calls.
+8. The real platform: what runs in the test runs the same on the real machine (its limits, its versions).
+9. Silence: when it cannot do its job, it says so (an alarm, a non-zero exit, « not checked »), never a silent skip
+   or a default that looks green.
+10. Existing data and the deploy: the rows already in production, a migration on them, retention and deletion; merge
+   = deploy (what goes first, and a sentence true only after another PR).
+11. Zero waste: the run ends with a clean exit code, its temporary files removed and no orphan process or container
+   left behind. If /tmp grew by 1 MB or a container lingers, the status is FAILED.
+12. A surgical diff: no duplicated file (_v2, _new, _old, copy), no change outside the strict scope of the issue.
+Plus the client's own lines: project.json `review_catches`.
+A lot with no code (a demo, a count, a test on the platform, research) answers 3, 7, 8, 9 and 11 only.
+
+## Evidence
+<the session writes: file:line, issue links, outputs that show the need>
+
+## Rules
+- Related open issues first (build rule 0): read the whole list in $issues before building; your report names each
+  related issue and says whether this lot closes it, advances it, touches it or contradicts it.
+- Read $rules and apply its build rules; the right to challenge this brief is yours (its paragraph applies verbatim).
+- Scratch files only under $scratch/, with names only this lot uses.
+- Lock your worktree while you build, right after `git worktree add` (or first thing, if the session made it):
+  git -C <worktree> worktree lock --reason "$lot building" <worktree>   (ship-lot unlocks it once pushed; by hand: git worktree unlock <worktree>)
+- Never push, never post, never message anyone.
+
+## Build and test
+$build
+- Before your report: ~/.claude/iphtah-kit/bin/verify-lot <worktree> --lot $lot  (it must say OK).
+
+## Stop points
+<the session writes: what makes you stop and report instead of guessing>
+- A test still red after two fix attempts: stop and report.
+
+## Report
+- the commits (sha and message), the files, the merge-check GREEN line, the verify-lot verdict;
+- the related issues and what this lot does to each;
+- each guard with its negative control, and the mutants (red, survived, or equivalent: say which);
+- what you challenged, and « Questions for the person » if any.

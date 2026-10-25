@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""prompt-lines --client C — a few lines put in front of the session at every prompt: the time, the next rituals (the client's rituals.json), the open loops; at session start, the loops due today."""
+import datetime as dt
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _zone
+TZ_NAME, HOME_TZ = _zone.home_zone()
+TZ_LABEL = _zone.label(TZ_NAME)
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def upcoming(rituals, now, horizon_days=7, limit=3):
+    out = []
+    for r in rituals:
+        tz = ZoneInfo(r.get("tz", TZ_NAME))
+        local = now.astimezone(tz)
+        times = r.get("times") or ([r["time"]] if r.get("time") else [None])
+        dates = ([dt.date.fromisoformat(r["date"])] if r.get("date") else
+                 [(local + dt.timedelta(days=d)).date() for d in range(horizon_days + 1)])
+        for day in dates:
+            if r.get("days") and DAYS[day.weekday()] not in r["days"]:
+                continue
+            for t in times:
+                if t:
+                    h, m = map(int, t.split(":"))
+                    when = dt.datetime.combine(day, dt.time(h, m), tzinfo=tz)
+                    if when >= now:
+                        out.append((when, r["name"], True))
+                        break
+                elif day >= local.date():
+                    out.append((dt.datetime.combine(day, dt.time(23, 59), tzinfo=tz), r["name"], False))
+            else:
+                continue
+            break
+    out.sort()
+    return out[:limit]
+
+
+def _project_key(path):
+    ""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(os.path.expanduser(path)))
+
+
+def start_client(transcript_path, clients_root=None):
+    ""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    key = os.path.basename(os.path.dirname(transcript_path))
+    root = clients_root or os.path.expanduser("~/.claude/iphtah-kit/clients")
+    for c in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        try:
+            d = json.load(open(os.path.join(root, c, "project.json")))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("session_dir") and key == _project_key(d["session_dir"]):
+            return c
+    return None
+
+
+def _below(cwd, folder):
+    ""
+    folder = os.path.realpath(os.path.expanduser(folder))
+    return cwd == folder or cwd.startswith(folder + os.sep)
+
+
+def client_of(cwd):
+    ""
+    cwd = os.path.realpath(os.path.expanduser(cwd or ""))
+    root = os.path.expanduser("~/.claude/iphtah-kit/clients")
+    files = {}
+    for c in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        pj = os.path.join(root, c, "project.json")
+        if not os.path.exists(pj):
+            continue
+        try:
+            files[c] = json.load(open(pj))
+        except ValueError:
+            continue
+    for c, d in files.items():
+        paths = [v.get("path") or v.get("local") for v in d.get("repos", {}).values() if isinstance(v, dict)] + [d.get("worktrees")]
+        if any(_below(cwd, p) for p in filter(None, paths)):
+            return c
+    for c, d in files.items():
+        if d.get("session_dir") and _below(cwd, d["session_dir"]):
+            return c
+    return None
+
+
+_LOOPS = []
+
+
+def _loops():
+    ""
+    if not _LOOPS:
+        _l = importlib.machinery.SourceFileLoader("loops_fmt", os.path.join(HERE, "loops"))
+        lp = importlib.util.module_from_spec(importlib.util.spec_from_loader("loops_fmt", _l))
+        _l.exec_module(lp)
+        _LOOPS.append(lp)
+    return _LOOPS[0]
+
+
+def loops_line(path, now):
+    ""
+    if not os.path.exists(path):
+        return None
+    paris = HOME_TZ
+    open_, late = [], []
+    for raw in open(path, encoding="utf-8"):
+        line = raw.strip()
+        if not line.startswith("- [ ]"):
+            continue
+        body = line[5:].strip()
+        open_.append(body)
+        try:
+            due = dt.datetime.strptime(body[:16], "%Y-%m-%d %H:%M").replace(tzinfo=paris)
+            if due < now:
+                late.append(re.sub(r"^acts:\S+\s*·\s*(?:made:\S+\s*·\s*)?", "", body[17:].strip(" ·")))
+        except ValueError:
+            pass
+    if not open_:
+        return None
+    text = f"Open loops: {len(open_)}"
+    if late:
+        text += f", {len(late)} overdue (first: {late[0][:60]})"
+    return text + f" — read {path.replace(os.path.expanduser('~'), '~')}."
+
+
+def state_dir(client, clients=None):
+    ""
+    pj = os.path.join(clients or os.path.expanduser("~/.claude/iphtah-kit/clients"), client, "project.json")
+    return os.path.expanduser(json.load(open(pj)).get("state_dir") or f"~/.local/state/{client}") \
+        if os.path.exists(pj) else os.path.expanduser(f"~/.local/state/{client}")
+
+
+def my_due_loops(path, now, limit=8):
+    ""
+    if not os.path.exists(path):
+        return []
+    paris = HOME_TZ
+    end = now.astimezone(paris).replace(hour=23, minute=59)
+    _l = importlib.machinery.SourceFileLoader("loops_fmt", os.path.join(HERE, "loops"))
+    lp = importlib.util.module_from_spec(importlib.util.spec_from_loader("loops_fmt", _l))
+    _l.exec_module(lp)
+    out = []
+    for raw in open(path, encoding="utf-8"):
+        p = lp.parse(raw.strip())
+        if not p or p["mark"] != " " or p["acts"] != "vela" or not p["when"]:
+            continue
+        try:
+            due = dt.datetime.strptime(p["when"] if " " in p["when"] else p["when"] + " 00:00",
+                                       "%Y-%m-%d %H:%M").replace(tzinfo=paris)
+        except ValueError:
+            continue
+        if due <= end:
+            out.append((due, f"{due:%d/%m %H:%M} {p['rest'].strip()[:110]}"))
+    out.sort()
+    return [t for _, t in out[:limit]] + ([f"… and {len(out) - limit} more"] if len(out) > limit else [])
+
+
+def print_my_due_loops(client, clients=None, now=None):
+    ""
+    if not client:
+        return
+    try:
+        path = os.path.join(state_dir(client, clients), "open-loops.md")
+        items = my_due_loops(path, now or dt.datetime.now(dt.timezone.utc))
+    except Exception as e:
+        print(f"My loops: unreadable ({e.__class__.__name__})")
+        return
+    if items:
+        print(f"My loops due today ({path.replace(os.path.expanduser('~'), '~')}, `loops close` when done):")
+        for t in items:
+            print(f"- {t}")
+
+
+def session_start(client, source="startup", clients=None, state=None, env=None, cwd=None):
+    ""
+    env = os.environ if env is None else env
+    if env.get("IPHTAH_HEADLESS") == "1":
+        return 0
+    clients = clients or os.path.expanduser("~/.claude/iphtah-kit/clients")
+    print_my_due_loops(client, clients)
+    if source not in ("startup", "resume"):
+        return 0
+    return 0
+
+
+OWN_PAUSE_REASONS = ("pause check failed", "pause file unreadable", "pause file empty")
+
+
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    client = a[a.index("--client") + 1] if "--client" in a else None
+    hook = {}
+    if "--auto" in a:
+        try:
+            hook = json.load(sys.stdin)
+            hook = hook if isinstance(hook, dict) else {}
+            cwd = hook.get("cwd")
+            client = start_client(hook.get("transcript_path")) or client_of(cwd if isinstance(cwd, str) else None)
+        except ValueError:
+            client = None
+    if "--session-start" in a:
+        return session_start(client, source=hook.get("source", "startup"), cwd=hook.get("cwd"))
+    now = dt.datetime.fromisoformat(a[a.index("--at") + 1]) if "--at" in a else dt.datetime.now(dt.timezone.utc)
+    paris = now.astimezone(HOME_TZ)
+    lines = [f"⏱ {paris:%a %d/%m %H:%M} {TZ_LABEL} ({now:%H:%M} UTC)."]
+    if client:
+        rp = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/rituals.json")
+        if os.path.exists(rp):
+            up = upcoming(json.load(open(rp)).get("rituals", []), now)
+            if up:
+                lines.append("Next — " + "; ".join(
+                    f"{w.astimezone(HOME_TZ):%a %H:%M} {n}" if timed else
+                    f"{w.astimezone(HOME_TZ):%a %d/%m} {n}" for w, n, timed in up))
+    if client:
+        state = state_dir(client)
+        ll = loops_line(os.path.join(state, "open-loops.md"), now)
+        if ll:
+            lines.append(ll)
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()

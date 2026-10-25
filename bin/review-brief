@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""review-brief — the brief of a fresh-eyes review sub-agent, generated instead of written.
+
+    review-brief --client C <worktree> <from>..<to> [--lot ID] [--what "<one line: what the change does>"]
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _purpose as P
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RULES = os.path.join(HERE, "..", "rituals", "brief-and-review-rules.md")
+
+
+def drop_item(questions, name):
+    ""
+    out, skip = [], False
+    for line in questions.splitlines():
+        if line.startswith("- **"):
+            skip = line.startswith(f"- **{name}**")
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
+
+
+HIGH_PATHS = ("migrat", "changelog", "alembic", ".sql", "schema",
+              "money", "payment", "refund", "wallet", "ledger", "currenc", "invoice", "billing", "pric",
+              "permission", "rights", "role", "grant", "polic", "acl", "access", "tenant", "admin",
+              "auth", "login", "secret", "token", "password", "crypt", "security", "firewall", "jwt", "keycloak",
+              "gdpr", "erase", "purge", "anonymi")
+LOW_SUFFIXES = (".md", ".txt", ".rst")
+NOT_LOW = ("claude.md", "vela.md", "agents.md", ".claude/", "agents/", "skills/", "templates/", "rituals/", "roles/",
+           "requirements", "constraints")
+ORDER = ("low", "normal", "high")
+WORDS = {"low": 150, "normal": 300, "high": 600}
+
+
+def actual_severity(files, extra_high=()):
+    ""
+    for f in files:
+        low = f.lower()
+        for pat in (*HIGH_PATHS, *extra_high):
+            if pat.lower() in low:
+                return "high", f"{f} matches « {pat} »"
+    if all(f.lower().endswith(LOW_SUFFIXES) and not any(n in f.lower() for n in NOT_LOW) for f in files):
+        return "low", "prose only"
+    return "normal", "code that is neither money, rights, security nor migration"
+
+
+def stop_rule(rules, severity):
+    ""
+    for line in section(rules, "Severity").splitlines():
+        if line.startswith(f"| **{severity.capitalize()}**"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            return cells[-1]
+    return ""
+
+
+def section(text, title):
+    m = re.search(rf"^## {re.escape(title)}.*?$\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    return m.group(1).strip() if m else ""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--client", required=True)
+    ap.add_argument("worktree")
+    ap.add_argument("range")
+    ap.add_argument("--lot")
+    ap.add_argument("--what", default="")
+    ap.add_argument("--focus", action="append", default=[])
+    ap.add_argument("--second-pass", action="store_true")
+    ap.add_argument("--words", type=int)
+    ap.add_argument("--purpose-file")
+    ap.add_argument("--severity", choices=ORDER, help="the severity declared at the launch; the higher one wins")
+    a = ap.parse_args()
+    wt = os.path.realpath(a.worktree)
+    if "..." not in a.range and ".." in a.range:
+        a.range = a.range.replace("..", "...", 1)
+    log = subprocess.run(["git", "log", "--oneline", "--right-only", a.range], cwd=wt, capture_output=True, text=True)
+    if log.returncode != 0:
+        sys.exit(f"review-brief: bad range {a.range} in {wt}: {log.stderr.strip()}")
+    rules = open(RULES).read()
+    questions = section(rules, "Review questions")
+    proj = json.load(open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")))
+    names = subprocess.run(["git", "diff", "--name-only", a.range], cwd=wt, capture_output=True, text=True)
+    if names.returncode != 0:
+        sys.exit(f"review-brief: cannot list the files of {a.range}: {names.stderr.strip()}")
+    actual, reason = actual_severity([f for f in names.stdout.splitlines() if f], proj.get("severity_high_paths", []))
+    severity = max(actual, a.severity or "low", key=ORDER.index)
+    catches = proj.get("review_catches", [])
+    if proj.get("human_contributors", True) is False:
+        questions = drop_item(questions, "Human maintainer")
+    words = a.words or (min(250, WORDS[severity]) if a.second_pass else WORDS[severity])
+
+    out = []
+    if a.lot and not P.valid_lot(a.lot):
+        ap.error(f"--lot must be a plain name (no path, not . or ..), got {a.lot!r}")
+    try:
+        purpose = P.read_purpose(a.purpose_file, a.lot)
+    except OSError as e:
+        ap.error(f"--purpose-file: {e}")
+    if a.second_pass and purpose is None:
+        out.append(P.PLACEHOLDER + "\n")
+    if a.lot:
+        out.append(f"LOT: {a.lot}\n")
+    kind = "Second pass, quick" if a.second_pass else "Fresh-eyes review"
+    out.append(f"{kind}, READ-ONLY: no edits, commits, pushes or posts. No full test suites: single test files only, "
+               f"through `~/.claude/iphtah-kit/bin/run-queued <maven|vitest> -- <cmd>`, and only if needed.\n")
+    out.append(f"Worktree `{wt}`. Review `git diff {a.range}`:\n```\n{log.stdout.strip()}\n```")
+    if a.what:
+        out.append(f"\nWhat the change does: {a.what}")
+    declared = f"declared {a.severity}" if a.severity else "none declared"
+    out.append(f"\n**Severity: {severity}** (read from the diff: {actual}, {reason}; {declared}). "
+               f"Review stops: {stop_rule(rules, severity)}. Size your review to it.")
+    if a.focus:
+        out.append("\n**Specific to this change:**\n" + "\n".join(f"- {f}" for f in a.focus))
+    if not a.second_pass:
+        if purpose is not None:
+            out.append("\n**The builder's stated purpose: challenge it if it aims at the wrong problem:**\n\n" + purpose)
+        else:
+            out.append("\nWarning: no purpose written for this lot (the builder's spec is invisible to you).")
+        if severity == "low":
+            out.append("\n**Check, in one pass:** is it correct? Which sentence does it make false (here or elsewhere)? "
+                       "Does each part say what it is for?")
+        elif severity == "normal":
+            out.append("\n**Review questions: answer those this diff touches, with file:line evidence; name the others "
+                       "in one line as not touched. Edge cases become an issue, not a finding:**\n" + questions)
+        else:
+            out.append("\n**Review questions (every one; answer with file:line evidence, or « nothing found »):**\n"
+                       + questions)
+        if catches and severity != "low":
+            out.append("\n**What this client's human reviewers have caught before (look for each):**\n"
+                       + "\n".join(f"- {c}" for c in catches))
+    else:
+        if purpose is not None:
+            out.append(f"\n**Purpose** (judge each fix against it: does it still stop what it must, and still allow what it must never block?):\n\n{purpose}")
+        out.append("\nCheck that each fix is correct and complete, and that it introduced nothing new "
+                   "(races, lost updates, a guard without a negative control).")
+    challenge = section(open(RULES).read(), "The right to challenge")
+    quote = "\n".join(l for l in challenge.splitlines() if l.startswith(">"))
+    if quote:
+        out.append("\n" + quote)
+    out.append(f"\n**Report** (under {words} words): findings ranked blocking / should fix / nit, each with file:line "
+               "and a concrete scenario. Say plainly « nothing blocking », or « clean » when nothing needs fixing "
+               "before push. End the report with one line of its own: « Verdict: clean » when nothing needs fixing "
+               "before push, else « Verdict: findings ».")
+    out.append("\n(For the session: paste this whole text as the reviewer's prompt.)")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

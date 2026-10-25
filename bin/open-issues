@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""open-issues --client C [--out FILE] [--max-age MIN] — every open issue of the client's repositories (and the
+watched support repositories), one line each: « owner/repo#n  title  [labels] ».
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def repos_of(pj):
+    ""
+    out = []
+    repos = pj.get("repos") or {}
+    for v in (repos.values() if isinstance(repos, dict) else repos):
+        name = v.get("github") if isinstance(v, dict) else None
+        if name and name not in out:
+            out.append(name)
+    for w in pj.get("issue_watch") or []:
+        if w.get("repo") and w["repo"] not in out:
+            out.append(w["repo"])
+    return out
+
+
+def line(repo, issue):
+    labels = ", ".join(l["name"] for l in issue.get("labels") or [])
+    return f"{repo}#{issue['number']}  {issue['title'].strip()}" + (f"  [{labels}]" if labels else "")
+
+
+UNREACHABLE = "(UNREACHABLE:"
+ISSUE_LINE = re.compile(r"^\S+#\d+  ")
+
+
+def fetch(repo):
+    try:
+        r = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
+                            "--json", "number,title,labels"], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("open-issues: gh (the GitHub command line) is not installed or not on the PATH, so the open issues "
+                 "cannot be listed; install it and run `gh auth login`")
+    if r.returncode != 0:
+        return [f"{repo}  (UNREACHABLE: {r.stderr.strip()[:120]})"]
+    return [line(repo, i) for i in sorted(json.loads(r.stdout), key=lambda i: i["number"])]
+
+
+def unreachable(path):
+    ""
+    return sum(1 for l in open(path) if UNREACHABLE in l)
+
+
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    if "-h" in a or "--help" in a or "--client" not in a[:-1]:
+        print(__doc__.strip())
+        return
+    client = a[a.index("--client") + 1]
+    pj = json.load(open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")))
+    state = os.path.expanduser(pj.get("state_dir") or f"~/.local/state/{client}")
+    out = a[a.index("--out") + 1] if "--out" in a else os.path.join(state, "open-issues.txt")
+    max_age = float(a[a.index("--max-age") + 1]) if "--max-age" in a else 30
+    if not (os.path.exists(out) and time.time() - os.path.getmtime(out) < max_age * 60 and not unreachable(out)):
+        lines = []
+        for repo in repos_of(pj):
+            lines += fetch(repo)
+        if lines and all(UNREACHABLE in l for l in lines):
+            sys.exit("open-issues: gh could not read any repository (not signed in? run `gh auth login`): " + "; ".join(lines)[:300])
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out + ".tmp", "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(out + ".tmp", out)
+    n = sum(1 for l in open(out) if ISSUE_LINE.match(l))
+    lost = unreachable(out)
+    print(f"{n} open issues → {out}" + (f" (WARNING: {lost} repository(ies) unreachable, listed as such; "
+                                          "not reused from the cache)" if lost else ""))
+
+
+if __name__ == "__main__":
+    main()

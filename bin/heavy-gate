@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""heavy-gate — Claude Code PreToolUse hook (Bash): no full test suite on the small machine.
+"""
+import datetime as dt
+import json
+import os
+import re
+import sys
+from importlib.machinery import SourceFileLoader
+
+_bin = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, _bin)
+
+
+def _log(*args, **kw):
+    ""
+    try:
+        import _safelog
+        _safelog.log(*args, **kw)
+    except BaseException:
+        pass
+
+
+_push = SourceFileLoader("push_gate", os.path.join(_bin, "push-gate")).load_module()
+_project = _push._project
+
+BYPASS = "IPHTAH_HEAVY_OK"
+RUN_QUEUED = "~/.claude/iphtah-kit/bin/run-queued"
+BURST_OFF = os.path.expanduser(os.environ.get("IPHTAH_BURST_OFF", "~/.local/state/iphtah-kit/burst-off"))
+
+MAVEN_PHASES = {"test", "verify", "install", "package", "integration-test", "deploy",
+                "surefire:test", "failsafe:integration-test"}
+MAVEN_VALUE_FLAGS = {"-pl", "--projects", "-P", "--activate-profiles", "-f", "--file", "-s",
+                     "--settings", "-T", "--threads", "-rf", "--resume-from", "-gs",
+                     "-l", "--log-file", "-t", "--toolchains", "-b", "--builder"}
+VITEST_VALUE_FLAGS = {"-c", "--config", "-r", "--root", "--dir", "--project", "--reporter",
+                      "--pool", "--maxWorkers", "--minWorkers", "--environment", "--outputFile",
+                      "--shard", "--mode", "--testTimeout", "--retry", "--coverage.provider",
+                      "-w", "--workspace", "--sequence.seed", "--bail"}
+PM_VALUE_FLAGS = {"-C", "--dir", "--filter", "-F", "--workspace", "-w", "--prefix", "--cwd"}
+WRAPPERS = {"time", "nohup", "nice", "ionice", "stdbuf", "env", "timeout", "command", "exec"}
+
+
+def deny(reason, wanted="command", winner="gate", rule="heavy_gate"):
+    ""
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "heavy-gate: " + reason,
+    }}))
+    try:
+        first = _first_time(TOOL_USE_ID)
+    except BaseException:
+        first = True
+    if first:
+        _log("heavy-gate", "refuse", [wanted, winner], winner, rule)
+    sys.exit(0)
+
+
+TOOL_USE_ID = ""
+SEEN = os.path.expanduser(os.environ.get("IPHTAH_HEAVY_SEEN", "~/.local/state/iphtah-kit/heavy-gate-seen"))
+
+
+def _first_time(tool_use_id):
+    ""
+    if not tool_use_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", tool_use_id):
+        return True
+    try:
+        os.makedirs(SEEN, exist_ok=True)
+    except OSError:
+        return True
+    try:
+        os.close(os.open(os.path.join(SEEN, tool_use_id), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    try:
+        old = dt.datetime.now().timestamp() - 86400
+        for name in os.listdir(SEEN):
+            path = os.path.join(SEEN, name)
+            if os.lstat(path).st_mtime < old:
+                os.unlink(path)
+    except OSError:
+        pass
+    return True
+
+
+def warn(msg):
+    print(json.dumps({"systemMessage": "heavy-gate: " + msg}))
+    sys.exit(0)
+
+
+def segments(command):
+    ""
+    seg, out = [], []
+    for t in _push.words(_push.without_heredocs(command)):
+        if t in ("&&", "||", ";", "|", "&"):
+            out.append(seg); seg = []
+        else:
+            seg.append(t)
+    out.append(seg)
+    return [s for s in out if s]
+
+
+def strip_prefix(s):
+    ""
+    bypassed = False
+    while s:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s[0]):
+            if s[0] == BYPASS + "=1":
+                bypassed = True
+            s = s[1:]
+        elif os.path.basename(s[0]) in WRAPPERS:
+            s = s[1:]
+            while s and (s[0].startswith("-") or re.fullmatch(r"\d+[smhd]?", s[0])):
+                s = s[2:] if s[0] in ("-n", "-k", "-s", "-c", "-i", "-o", "-e") else s[1:]
+        else:
+            break
+    return s, bypassed
+
+
+def is_target(arg):
+    return not arg.startswith("-")
+
+
+def maven(s):
+    ""
+    if os.path.basename(s[0]) not in ("mvn", "mvnw", "mvnw.cmd"):
+        return None
+    goals, targeted, skip, i = [], False, False, 1
+    while i < len(s):
+        a = s[i]
+        if a == "-D" and i + 1 < len(s):
+            a, i = "-D" + s[i + 1], i + 2
+        elif a in MAVEN_VALUE_FLAGS:
+            i += 2
+            continue
+        else:
+            i += 1
+        if a.startswith(("-Dtest=", "-Dit.test=")):
+            targeted = True
+        elif re.match(r"^-D(skipTests|maven\.test\.skip)(=true)?$", a):
+            skip = True
+        elif not a.startswith("-"):
+            goals.append(a)
+    if skip or not MAVEN_PHASES & set(goals):
+        return None
+    return "targeted" if targeted else "full"
+
+
+def vitest_args(args):
+    ""
+    i = 0
+    if args and args[0] in ("run", "watch", "dev", "related"):
+        i = 1
+    while i < len(args):
+        a = args[i]
+        if a in ("-t", "--testNamePattern") or a.startswith(("-t=", "--testNamePattern=")):
+            return "targeted"
+        if a == "--":
+            i += 1; continue
+        if a in VITEST_VALUE_FLAGS:
+            i += 2; continue
+        if is_target(a):
+            return "targeted"
+        i += 1
+    return "full"
+
+
+LAUNCHERS = {"pnpm", "npx", "npm", "yarn", "node", "bunx"}
+
+
+def _launched(before):
+    ""
+    if not before:
+        return True
+    if os.path.basename(before[0]) not in LAUNCHERS:
+        return False
+    i = 1
+    while i < len(before):
+        a = before[i]
+        if a in PM_VALUE_FLAGS:
+            i += 2; continue
+        if a in ("exec", "dlx", "x", "--") or a.startswith("-"):
+            i += 1; continue
+        return False
+    return True
+
+
+def vitest(s):
+    ""
+    names = [os.path.basename(t) for t in s]
+    for k, n in enumerate(names):
+        if n in ("vitest", "vitest.mjs") and _launched(s[:k]):
+            return vitest_args(s[k + 1:])
+    if "turbo" in names and _launched(s[:names.index("turbo")]):
+        rest = s[names.index("turbo") + 1:]
+        if rest and rest[0] == "run":
+            rest = rest[1:]
+        if rest and rest[0] == "test":
+            after = rest[rest.index("--") + 1:] if "--" in rest else []
+            return vitest_args(after) if after else "full"
+        return None
+    if names[0] in ("pnpm", "npm", "yarn"):
+        i = 1
+        while i < len(s) and s[i].startswith("-"):
+            i += 2 if s[i] in PM_VALUE_FLAGS else 1
+        rest = s[i:]
+        if rest and rest[0] in ("run", "run-script"):
+            rest = rest[1:]
+        if rest and rest[0] in ("test", "t"):
+            return vitest_args(rest[1:])
+    return None
+
+
+def classify(command, cwd, depth=0):
+    ""
+    found = []
+    for s in segments(command):
+        if s[0] == "cd" and len(s) > 1:
+            cwd = os.path.join(cwd, os.path.expanduser(s[1]))
+            continue
+        s, bypassed = strip_prefix(s)
+        if not s:
+            continue
+        here = cwd
+        if os.path.basename(s[0]) in ("pnpm", "npm", "yarn") and len(s) > 2 and s[1] in ("-C", "--dir", "--prefix", "--cwd"):
+            here = os.path.join(cwd, os.path.expanduser(s[2]))
+        if os.path.basename(s[0]) in ("bash", "sh", "zsh") and "-c" in s and depth < 3:
+            inner = s[s.index("-c") + 1] if s.index("-c") + 1 < len(s) else ""
+            for f in classify(inner, cwd, depth + 1):
+                found.append(f[:3] + (f[3] or bypassed,) + f[4:])
+            continue
+        if os.path.basename(s[0]) == "run-queued":
+            rest = s[s.index("--") + 1:] if "--" in s else s[2:]
+            qkind = s[1] if len(s) > 1 else None
+            for f in classify(" ".join(_quote(t) for t in rest), cwd, depth + 1):
+                found.append((f[0], f[1], qkind == f[0], f[3] or bypassed, f[4], f[5]))
+            continue
+        for kind, test in (("maven", maven), ("vitest", vitest)):
+            scope = test(s)
+            if scope:
+                found.append((kind, scope, False, bypassed, here, " ".join(_quote(t) for t in s)))
+    return found
+
+
+def _quote(t):
+    import shlex
+    return shlex.quote(t)
+
+
+def _high_speed():
+    ""
+    try:
+        m = json.load(open(os.path.expanduser("~/.local/state/iphtah-kit/mode.json")))
+        return m.get("mode") == "high-speed" and dt.datetime.fromisoformat(m["until"]) > dt.datetime.now(dt.timezone.utc)
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def box_available(cwd):
+    ""
+    if os.path.exists(BURST_OFF) and not _high_speed():
+        return False
+    while cwd not in ("", "/") and not os.path.isdir(cwd):
+        cwd = os.path.dirname(cwd)
+    try:
+        repo = _push.which_repo(cwd)
+    except Exception:
+        repo = None
+    if repo is None:
+        return False
+    return bool(repo.get("burst") or repo.get("remote_build"))
+
+
+POSTING = {
+    "gh": re.compile(r"\bgh\b[^\n;&|]*\b(?:(?:issue|pr)\s+(?:comment|create|edit|review)\b"
+                     r"|(?:issue|pr)\s+close\b[^\n;&|]*(?:--comment|\s-c\b)|pr\s+merge\b[^\n;&|]*(?:--body|\s-b\b)"
+                     r"|api\b[^\n;&|]*\s-[fF]\s*['\"]?body=|release\s+(?:create|edit)\b[^\n;&|]*(?:--notes|\s-n\b))"),
+}
+ROUTE = {
+    "gh": "gh: `--body-file <file>` (or `--notes-file`, `-F body=@<file>`)",
+}
+ALLOWED = re.compile(r"\"\$\(cat\s+(?:[^\s()`<>|;&'\"]+|\"[^\"`]*\")\s*\)\""
+                     r"|\"\$\(cat\s+<<-?\s*\S+\s*\)\"")
+DQ = r"\"(?:[^\"\\]|\\.)*\""
+TEXT = re.compile(r"(?:^|\s)(?:--body|-b|--title|-t|--notes|-n|--comment|-c|-m)(?:\s+|=)(" + DQ + ")"
+                  r"|(?:^|\s)-[fF]\s*body=(" + DQ + ")"
+                  r"|(?:^|[\s/;&|(])wa\s+(?:notify\s+|send\s+\S+\s+)(" + DQ + ")", re.M)
+SHELL_CHAR = re.compile(r"[`$]")
+ESCAPED = re.compile(r"\\.")
+TOOL_BODY = re.compile(r"(\b(?:iphtah-issue|new-item)\b[^\n;&|]*?\s)--body(?:\s+|=)" + DQ)
+ONE_VARIABLE = re.compile(r"\"\$(?:\w+|\{[^}`$]*\})\"")
+
+
+KILL_TEXT = re.compile(r"\b(pkill|pgrep)\b[^|;&\n]*\s-[A-Za-z]*f")
+
+
+def self_matching_kill(command):
+    ""
+    return bool(KILL_TEXT.search(without_quoted_heredocs(command)))
+
+
+def without_quoted_heredocs(command):
+    ""
+    out, lines, i = [], command.split("\n"), 0
+    while i < len(lines):
+        out.append(lines[i])
+        quoted = [m.group(2) for m in _push._HEREDOC.finditer(lines[i]) if m.group(1)]
+        i += 1
+        for marker in quoted:
+            while i < len(lines) and lines[i].strip() != marker:
+                i += 1
+            i += 1
+    return "\n".join(out)
+
+
+def posting_families(command):
+    ""
+    text = _push.without_heredocs(command)
+    return [k for k, rx in POSTING.items() if rx.search(text)]
+
+
+def shell_rewrites_text(command):
+    ""
+    text = ALLOWED.sub('""', without_quoted_heredocs(command))
+    text = TOOL_BODY.sub(r"\1", text)
+    texts = [next(g for g in m.groups() if g) for m in TEXT.finditer(text)]
+    return any(SHELL_CHAR.search(ESCAPED.sub("", t)) and not ONE_VARIABLE.fullmatch(t) for t in texts)
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        sys.exit(0)
+    command = (data.get("tool_input") or {}).get("command", "")
+    global TOOL_USE_ID
+    TOOL_USE_ID = str(data.get("tool_use_id") or "")
+    if self_matching_kill(command):
+        deny("pkill -f / pgrep -f refused: the pattern also matches your own command (it kills or waits for itself). "
+             "Find the number with `ps -eo pid,args | grep '<pattern>' | grep -v grep`, check it is yours, then "
+             "`kill <pid>`; to wait, use `bin/when-quiet -- <command>`. If these words are a text (a note, a "
+             "message), pass it through a heredoc with a quoted delimiter (<<'EOF') or a file.",
+             "pkill_f", "self_match", "no_pkill_f")
+    families = posting_families(command)
+    if families and shell_rewrites_text(command):
+        split = " (or split the command: the part that posts already reads a file, the ` or $ is elsewhere)" \
+            if re.search(r"--body-file|--notes-file|body=@", command) or "tool" in families else ""
+        deny("posted text: a ` or a $ in a command that posts is rewritten by bash before it leaves. "
+             "Write the text in a file (the Write tool, or `cat > F <<'EOF'`), then "
+             + "; ".join(ROUTE[f] for f in families) + split + ".", "post_with_shell_char", "shell_body", "body_from_file")
+    if not re.search(r"mvn|vitest|test", command):
+        sys.exit(0)
+    try:
+        found = classify(command, data.get("cwd") or os.getcwd())
+    except ValueError:
+        warn("could not parse this command; test runs NOT checked.")
+    for kind, scope, queued, bypassed, cwd, text in found:
+        if bypassed:
+            continue
+        if not queued:
+            deny(f"a {kind} {'full' if scope == 'full' else 'targeted'} run goes through the queue of this machine: "
+                 f"run it as {RUN_QUEUED} {kind} -- {text}",
+                 f"{kind}_{scope}_run", "slot_queue", "run_through_run_queued")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

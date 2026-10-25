@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""migration-lint <repo> [--base REF] [--head REF] [--client C]
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FLYWAY = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$")
+REPEATABLE = re.compile(r"^R__.+\.sql$")
+NUMBERED = re.compile(r"^(\d+)_.+\.sql$")
+ERRORS = {"M1", "M5", "M6", "M7"}
+ALLOW = re.compile(r"--\s*lint:\s*allow\s+((?:M\d+\s*,?\s*)+)(.*)$", re.I)
+GITHUB_REMOTE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+PR_ADDS = {"added", "renamed", "copied"}
+EXIT_NO_PRS = 3
+
+
+class PrSource(Exception):
+    ""
+
+
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.stderr.write(f"migration-lint: git {' '.join(args)}: {r.stderr.strip()}\n")
+        sys.exit(2)
+    return r.stdout
+
+
+def resolve_base(repo, base, client):
+    if base:
+        return base
+    try:
+        project = SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project")).load_module()
+        b = project.base_of(repo, client)
+    except Exception:
+        b = None
+    return f"origin/{b}" if b else "origin/main"
+
+
+def github_of(repo, client):
+    ""
+    try:
+        project = SourceFileLoader("iphtah_project", os.path.join(HERE, "iphtah-project")).load_module()
+        entry = project.repo_of(repo, client)
+        if entry and entry.get("github"):
+            return entry["github"]
+    except Exception:
+        pass
+    m = GITHUB_REMOTE.search(git(repo, "remote", "get-url", "origin", check=False).strip())
+    return m.group(1) if m else None
+
+
+def gh_api(path):
+    ""
+    try:
+        r = subprocess.run(["gh", "api", "--paginate", path], capture_output=True, text=True)
+    except OSError as e:
+        raise PrSource(f"gh: {e}")
+    if r.returncode != 0:
+        why = (r.stderr.strip().splitlines() or [""])[-1][:200]
+        raise PrSource(f"gh api {path}: exit {r.returncode}: {why}")
+    out, pos, text = [], 0, r.stdout
+    dec = json.JSONDecoder()
+    try:
+        while pos < len(text):
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            if pos >= len(text):
+                break
+            page, pos = dec.raw_decode(text, pos)
+            out.extend(page if isinstance(page, list) else [page])
+    except ValueError as e:
+        raise PrSource(f"gh api {path}: unreadable answer ({e})")
+    return out
+
+
+def open_prs_from_gh(slug):
+    ""
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        heads = gh_api(f"repos/{slug}/pulls?state=open&per_page=100")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            lists = list(pool.map(lambda pr: gh_api(f"repos/{slug}/pulls/{pr['number']}/files?per_page=100"),
+                                  heads))
+        return [{"number": pr["number"], "head": pr["head"]["ref"], "base": pr["base"]["ref"],
+                 "title": pr.get("title", ""),
+                 "files": [{"path": f["filename"], "status": f.get("status", "")} for f in files]}
+                for pr, files in zip(heads, lists)]
+    except (KeyError, TypeError, AttributeError) as e:
+        raise PrSource(f"repos/{slug}: unexpected answer shape ({e.__class__.__name__}: {e})")
+
+
+def open_prs_from_file(path):
+    try:
+        with open(path) as f:
+            prs = json.load(f)
+        for pr in prs:
+            pr["number"], pr["head"], pr["files"]
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        raise PrSource(f"{path}: {e}")
+    return prs
+
+
+def current_branch(repo, head):
+    ""
+    if head != "HEAD":
+        return re.sub(r"^(origin|upstream)/", "", head)
+    name = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).strip()
+    return None if name in ("", "HEAD") else name
+
+
+def taken_by_open_prs(added, prs, own_branch):
+    ""
+    taken, top = {}, {}
+    for pr in prs:
+        if own_branch and pr.get("head") == own_branch:
+            continue
+        for f in pr.get("files", []):
+            if f.get("status", "added") not in PR_ADDS:
+                continue
+            theirs = f["path"]
+            tv = version(theirs)
+            if tv is None or kind(theirs) is None:
+                continue
+            d = os.path.dirname(theirs)
+            fly = bool(FLYWAY.match(os.path.basename(theirs)))
+            if (d, fly) not in top or tv > top[(d, fly)]:
+                top[(d, fly)] = tv
+            for ours in added:
+                if ours == theirs or os.path.dirname(ours) != d:
+                    continue
+                if bool(FLYWAY.match(os.path.basename(ours))) != fly or version(ours) != tv:
+                    continue
+                taken.setdefault(ours, []).append((pr, theirs))
+    return taken, top
+
+
+def kind(path):
+    ""
+    name = os.path.basename(path)
+    if FLYWAY.match(name):
+        return "flyway"
+    if REPEATABLE.match(name):
+        return "repeatable"
+    if name.endswith(".sql") and "migrations" in path.split("/")[:-1]:
+        return "numbered" if NUMBERED.match(name) else "sql"
+    return None
+
+
+def version(path):
+    name = os.path.basename(path)
+    m = FLYWAY.match(name) or NUMBERED.match(name)
+    return tuple(int(x) for x in re.split(r"[._]", m.group(1))) if m else None
+
+
+def vtext(path, v):
+    return ("V" if FLYWAY.match(os.path.basename(path)) else "") + ".".join(map(str, v))
+
+
+def mask(sql):
+    ""
+    out, ends, i, n, dollar = list(sql), [], 0, len(sql), None
+    while i < n:
+        c = sql[i]
+        if dollar is None and c == ";":
+            ends.append(i)
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'" and sql.startswith("''", j):
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    break
+                j += 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j + 1
+            continue
+        if c == "$":
+            m = re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$", sql[i:])
+            if m:
+                tag = m.group(0)
+                dollar = None if dollar == tag else (tag if dollar is None else dollar)
+                i += len(tag)
+                continue
+        i += 1
+    return "".join(out), ends
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def statements(masked, ends):
+    start = 0
+    for e in ends + [len(masked)]:
+        yield start, masked[start:e]
+        start = e + 1
+
+
+NOT_A_TYPE_AFTER = re.compile(r"\s+(timestamptz|timestamp|date|time|text|varchar|character|char|int\w*|bigint|"
+                              r"smallint|serial|bigserial|boolean|bool|numeric|decimal|uuid|jsonb?|real|double|"
+                              r"bytea)\b", re.I)
+
+
+def exact_comparison(text, after, offset):
+    ""
+    for m in re.finditer(r"(?:<>|!=|(?<![<>!:=])=(?!>))\s*(\d+)\b", text[after:]):
+        if int(m.group(1)) >= 1:
+            return offset + after + m.start(), m.group(1)
+    for m in re.finditer(r"(?<![\w.$])(\d+)\s*(?:<>|!=|=(?![>=]))", text[after:]):
+        if int(m.group(1)) >= 1:
+            return offset + after + m.start(), m.group(1)
+    return None
+
+
+def casts_back_to_date(masked, pos):
+    ""
+    depth = 0
+    for i in range(pos, min(len(masked), pos + 300)):
+        ch = masked[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return bool(re.match(r"\s*::\s*date\b", masked[i + 1:i + 20], re.I))
+            depth -= 1
+        elif ch in ";,":
+            if depth == 0:
+                return False
+    return False
+
+
+def lint_text(path, sql, created_tables):
+    masked, ends = mask(sql)
+    found = []
+
+    def add(rule, pos, reason):
+        found.append((rule, path, line_of(masked, pos) if pos is not None else 1, reason))
+
+    for m in re.finditer(r"\btimestamp\b", masked, re.I):
+        if m.start() > 0 and masked[m.start() - 1] in "\".":
+            continue
+        if masked[max(0, m.start() - 2):m.start()] == "::" and casts_back_to_date(masked, m.start()):
+            continue
+        rest = masked[m.end():m.end() + 200]
+        rest = re.sub(r"^\s*\(\s*\d+\s*\)", "", rest)
+        if re.match(r"\s+with\s+time\s+zone\b", rest, re.I):
+            continue
+        if NOT_A_TYPE_AFTER.match(rest):
+            continue
+        add("M1", m.start(), "timestamp without time zone: use timestamptz")
+
+    new_columns = {}
+    for start, stmt in statements(masked, ends):
+        alt = re.match(r"\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)", stmt, re.I)
+        if alt:
+            new_columns.setdefault(norm(alt.group(1)), set()).update(
+                norm(c) for c in re.findall(r"\badd\s+column\s+(?:if\s+not\s+exists\s+)?([\w\"]+)", stmt, re.I))
+    for start, stmt in statements(masked, ends):
+        if re.search(r"raise\s+exception", stmt, re.I) and re.search(r"\bcount\s*\(", stmt, re.I):
+            hit = None
+            for inner in re.finditer(r"[^;]*", stmt):
+                cnt = re.search(r"\bcount\s*\(", inner.group(0), re.I)
+                if cnt:
+                    hit = exact_comparison(inner.group(0), cnt.end(), start + inner.start())
+                if hit:
+                    break
+            if not hit:
+                for cond in re.finditer(r"\bIF\b(.*?)\bTHEN\b", stmt, re.I | re.S):
+                    hit = exact_comparison(cond.group(1), 0, start + cond.start(1))
+                    if hit:
+                        break
+            if hit:
+                add("M2", hit[0], f"self-check raises unless a count is exactly {hit[1]}: "
+                    "a client's own rows can stop the boot")
+        alt = re.match(r"\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)", stmt, re.I)
+        if alt:
+            table = norm(alt.group(1))
+            for chk in re.finditer(r"\badd\s+(?:constraint\s+[\w\"]+\s+)?check\b", stmt, re.I):
+                if table in created_tables or re.search(r"\bnot\s+valid\b", stmt, re.I):
+                    continue
+                if check_columns(stmt[chk.end():]) <= new_columns.get(table, set()):
+                    continue
+                add("M4", start + chk.start(), f"CHECK added to existing table {table} without NOT VALID "
+                    "(validate it in a later step)")
+
+    for m in re.finditer(r"\bcreate\s+statistics\b[^;]*?\bfrom\s+([\w.\"]+)", masked, re.I):
+        table = norm(m.group(1))
+        later = masked[m.end():]
+        analyzed = any(norm(a.group(1)) == table or a.group(1) == ""
+                       for a in re.finditer(r"\banalyze\s+(?:verbose\s+)?([\w.\"]*)", later, re.I))
+        if not analyzed:
+            add("M3", m.start(), f"CREATE STATISTICS on {table} without a later ANALYZE {table}")
+    return found
+
+
+SQL_WORDS = {"and", "or", "not", "in", "is", "null", "between", "true", "false", "like", "ilike", "any", "all",
+             "array", "case", "when", "then", "else", "end", "distinct", "from", "similar", "to", "escape",
+             "current_date", "current_timestamp", "now", "interval"}
+
+
+def check_columns(after):
+    ""
+    m = re.match(r"\s*\(", after)
+    if not m:
+        return {"?"}
+    depth, i = 0, m.start()
+    for i in range(m.end() - 1, len(after)):
+        depth += {"(": 1, ")": -1}.get(after[i], 0)
+        if depth == 0:
+            break
+    expr = after[m.end():i]
+    cols = set()
+    for w in re.finditer(r"(?<![\w:.])([A-Za-z_\"][\w\"]*)(?![\w\"])(?!\s*\()", expr):
+        if expr[max(0, w.start() - 2):w.start()] == "::":
+            continue
+        name = norm(w.group(1))
+        if name and name not in SQL_WORDS:
+            cols.add(name)
+    return cols
+
+
+def norm(name):
+    return name.replace('"', "").split(".")[-1].lower()
+
+
+def created(sql):
+    masked, _ = mask(sql)
+    return {norm(m.group(1)) for m in
+            re.finditer(r"\bcreate\s+(?:unlogged\s+)?table\s+(?:if\s+not\s+exists\s+)?([\w.\"]+)", masked, re.I)}
+
+
+def allowed(lines, line, rule):
+    for ln in (line, line - 1):
+        if 1 <= ln <= len(lines):
+            m = ALLOW.search(lines[ln - 1])
+            if m and rule.upper() in re.findall(r"M\d+", m.group(1).upper()) and m.group(2).strip():
+                return m.group(2).strip()
+    return None
+
+
+def next_free(*versions):
+    ""
+    top = max(v for v in versions if v is not None)
+    return top[:-1] + (top[-1] + 1,)
+
+
+def local_rivals(repo, base, head, own_branch):
+    ""
+    ours = git(repo, "rev-parse", head, check=False).strip()
+    out, n = {}, 0
+    refs = subprocess.run(["git", "-C", repo, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"],
+                          capture_output=True, text=True)
+    if refs.returncode != 0:
+        raise PrSource(refs.stderr.strip() or f"git for-each-ref exit {refs.returncode}")
+    for row in refs.stdout.splitlines():
+        name, _, sha = row.partition(" ")
+        if name == own_branch or sha == ours:
+            continue
+        mb = git(repo, "merge-base", base, sha, check=False).strip()
+        if not mb or mb == sha:
+            continue
+        n += 1
+        for line in git(repo, "diff", "--name-status", "--diff-filter=ACR", mb, sha, check=False).splitlines():
+            path = line.split("\t")[-1]
+            v = version(path)
+            if v is None or kind(path) is None:
+                continue
+            fly = bool(FLYWAY.match(os.path.basename(path)))
+            out.setdefault((os.path.dirname(path), fly, v), []).append((name, path))
+    return out, n
+
+
+def run(repo, base, head="HEAD", prs=None, own_branch=None):
+    ""
+    mb = git(repo, "merge-base", base, head).strip()
+    diff = git(repo, "diff", "--name-status", "-M", mb, head).splitlines()
+    changes = []
+    for row in diff:
+        parts = row.split("\t")
+        st = parts[0][0]
+        old, new = (parts[1], parts[2]) if st in "RC" else (parts[1], parts[1])
+        if kind(new) or kind(old):
+            changes.append((st, old, new))
+    findings = []
+    added = [new for st, old, new in changes if st in "ACR" and kind(new)]
+    contents = {p: git(repo, "show", f"{head}:{p}") for st, _, p in changes if st != "D" and kind(p)}
+    new_tables = set()
+    for p in added:
+        new_tables |= created(contents[p])
+
+    for st, old, new in changes:
+        if st in "MDR" and kind(old) not in (None, "repeatable"):
+            what = {"M": "modified", "D": "removed", "R": f"renamed to {new}"}[st]
+            findings.append(("M5", old if st != "M" else new, 1,
+                             f"applied migration {what}: add a new migration instead"))
+        if st != "D" and kind(new):
+            findings += lint_text(new, contents[new], new_tables)
+
+    by_dir = {}
+    for p in added:
+        if version(p) is not None:
+            by_dir.setdefault(os.path.dirname(p), []).append(p)
+    problems, notes = [], []
+    rivals = {}
+    if by_dir:
+        try:
+            rivals, n = local_rivals(repo, base, head, own_branch)
+            notes.append(f"{n} other local branch(es) ahead of the base compared (M8)")
+        except PrSource as e:
+            problems.append(f"M8 could not read the local branches: {e}")
+    if prs is not None and by_dir and callable(prs):
+        try:
+            prs = prs()
+        except PrSource as e:
+            problems.append(f"could not read open PRs: {e}")
+            prs = None
+    for d, paths in by_dir.items():
+        listed = set(git(repo, "ls-tree", "--name-only", f"{base}:{d}" if d else base, check=False).split())
+        listed |= set(git(repo, "ls-tree", "--name-only", f"{mb}:{d}" if d else mb, check=False).split())
+        same_kind = [f for f in listed if version(f) is not None and
+                     bool(FLYWAY.match(f)) == bool(FLYWAY.match(os.path.basename(paths[0])))]
+        top = max((version(f) for f in same_kind if f not in {os.path.basename(p) for p in paths}),
+                  default=None)
+        seen = {}
+        for p in sorted(paths, key=version):
+            v = version(p)
+            if os.path.basename(p) in listed and git(repo, "rev-parse", f"{base}:{p}", check=False).strip() == \
+                    git(repo, "rev-parse", f"{head}:{p}", check=False).strip():
+                continue
+            if v in seen:
+                findings.append(("M6", p, 1, f"same number {vtext(p, v)} as {os.path.basename(seen[v])}"))
+            elif top is not None and v <= top:
+                findings.append(("M6", p, 1, f"{vtext(p, v)} is at or below the base's maximum "
+                                 f"{vtext(p, top)} in {d}/: take the first free number above it"))
+            seen.setdefault(v, p)
+        for p in paths:
+            fly = bool(FLYWAY.match(os.path.basename(p)))
+            for branch, their in rivals.get((d, fly, version(p)), []):
+                if their != p:
+                    findings.append(("M8", p, 1, f"{vtext(p, version(p))} is also added by the local branch "
+                                     f"{branch} ({os.path.basename(their)}): one of the two lots renumbers", "warn"))
+        if prs is not None:
+            taken, pr_top = taken_by_open_prs(paths, prs, own_branch)
+            fly = bool(FLYWAY.match(os.path.basename(paths[0])))
+            free = next_free(top, pr_top.get((d, fly)), *(version(p) for p in paths))
+            adds = sorted({(version(f["path"]), pr["number"]) for pr in prs if pr.get("head") != own_branch
+                           for f in pr.get("files", []) if f.get("status", "added") in PR_ADDS
+                           and os.path.dirname(f["path"]) == d and version(f["path"]) is not None
+                           and bool(FLYWAY.match(os.path.basename(f["path"]))) == fly})
+            notes.append(f"{len(prs)} open PR(s) read; in {d}/ they add "
+                         + (", ".join(f"{vtext(paths[0], v)} (#{n})" for v, n in adds) if adds else "nothing")
+                         + f"; first free number: {vtext(paths[0], free)}")
+            own_pr = min((pr["number"] for pr in prs if own_branch and pr.get("head") == own_branch), default=None)
+            for p in paths:
+                for pr, their_path in taken.get(p, []):
+                    where = f"#{pr['number']} ({pr.get('head', '?')} → {pr.get('base', '?')}: {os.path.basename(their_path)})"
+                    if own_pr is None or pr["number"] < own_pr:
+                        findings.append(("M7", p, 1, f"{vtext(p, version(p))} is also added by the older open PR {where}"
+                                         f"{': it keeps the number' if own_pr is not None else ' (this branch has no PR yet)'}; "
+                                         f"first free number above the base and every open PR: {vtext(p, free)}", "error"))
+                    else:
+                        findings.append(("M7", p, 1, f"{vtext(p, version(p))} is also added by the younger open PR {where}: "
+                                         f"ours (#{own_pr}) is older and keeps the number; the renumbering is theirs "
+                                         f"(first free: {vtext(p, free)})", "warn"))
+
+    out = []
+    for f in findings:
+        rule, path, line, reason = f[:4]
+        severity = f[4] if len(f) > 4 else ("error" if rule in ERRORS else "warn")
+        lines = contents.get(path, "").splitlines()
+        out.append((rule, path, line, reason, allowed(lines, line, rule), severity))
+    out.sort(key=lambda f: (f[1], f[2], f[0]))
+    return out, sorted({c[2] for c in changes if c[0] != "D"} | {c[1] for c in changes if c[0] == "D"}), problems, notes
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repo")
+    ap.add_argument("--base", help="base ref (default: origin/<base branch> from project.json, or origin/main)")
+    ap.add_argument("--head", default="HEAD", help="ref to lint (default HEAD)")
+    ap.add_argument("--client")
+    ap.add_argument("--open-prs", action="store_true",
+                    help="M7: compare the added numbers with every other open PR of the repository (gh api)")
+    ap.add_argument("--open-prs-from", metavar="FILE", help="M7 with the open PRs read from a JSON file, not gh")
+    ap.add_argument("--branch", help="the branch under lint, whose own PR M7 skips (default: the checked-out one)")
+    a = ap.parse_args()
+    repo = os.path.expanduser(a.repo)
+    base = resolve_base(repo, a.base, a.client)
+    prs = None
+    if a.open_prs_from:
+        prs = lambda: open_prs_from_file(a.open_prs_from)
+    elif a.open_prs:
+        slug = github_of(repo, a.client)
+        if slug:
+            prs = lambda: open_prs_from_gh(slug)
+        else:
+            def prs():
+                raise PrSource(f"{repo}: no GitHub repository in project.json nor on the origin remote")
+    findings, files, problems, notes = run(repo, base, a.head, prs, a.branch or current_branch(repo, a.head))
+    if not files:
+        print(f"migration-lint: no migration added or changed against {base}")
+        return 0
+    errors = warns = accepted = 0
+    for rule, path, line, reason, ok, severity in findings:
+        if ok:
+            accepted += 1
+            print(f"allowed {rule} {path}:{line} — {reason} (allowed: {ok})")
+        elif severity == "error":
+            errors += 1
+            print(f"ERROR   {rule} {path}:{line} — {reason}")
+        else:
+            warns += 1
+            print(f"warn    {rule} {path}:{line} — {reason}")
+    print(f"migration-lint: {len(files)} migration file(s) against {base}: "
+          f"{errors} error(s), {warns} warning(s), {accepted} allowed"
+          + (" — numbers compared with the open PRs" if any("open PR" in n for n in notes) else ""))
+    for n in notes:
+        print(f"migration-lint: {n}")
+    for p in problems:
+        print(f"migration-lint: {p}", file=sys.stderr)
+    if errors:
+        return 1
+    return EXIT_NO_PRS if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
