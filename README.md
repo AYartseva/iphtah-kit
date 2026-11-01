@@ -107,6 +107,7 @@ client's repository, next to this kit, never in it; your Claude reads it there.
      push-gate reads, the build results, and the throwaway worktrees it builds in; `--uninstall` leaves it, named;
    - before the first write, copies your `CLAUDE.md` and `settings.json` as they were to
      `~/.claude/iphtah-kit-backup/<timestamp>/`.
+   The installer also sets up a user timer, `egress sample` every 5 minutes: what this account's processes talk to, kept on this machine. `egress profile` shows it, with what's new since yesterday; on a server, `loginctl enable-linger` keeps it running after you log out.
    `--role dev` installs the dev role instead of the lead developer's. Running it again changes nothing.
 
 Reading and never installing is a fine outcome. So is installing one role, trying it for a week, and removing it.

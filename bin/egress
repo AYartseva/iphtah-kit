@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""egress sample | profile [--since 7d] — what our own processes talk to, sampled every 5 minutes without root.
+
+    egress profile [--since 7d]  per process, its destinations with first and last seen and how many samples saw
+"""
+import calendar
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import _decisions
+
+MAX_BYTES = 4_000_000
+MAX_DEST = 200
+MAX_LOOKUPS = 10
+LOOKUP_S = 1.0
+MAX_CACHE = 2000
+CACHE_DAYS = 7
+NAME = re.compile(r"[^A-Za-z0-9_.+:@ -]")
+HOST = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+USERS = re.compile(r'users:\(\("((?:[^"\\]|\\.)*)",pid=(\d+)')
+
+
+def log_path():
+    p = os.environ.get("IPHTAH_EGRESS_LOG")
+    if p:
+        return p
+    if "unittest" in sys.modules:
+        return None
+    return os.path.expanduser("~/.local/state/iphtah-kit/egress.jsonl")
+
+
+def in_git(path):
+    ""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
+
+
+def checked_log():
+    p = log_path()
+    if p and in_git(p):
+        raise SystemExit(f"egress: refused, the log {p} is inside a git work tree (it is machine-private)")
+    return p
+
+
+def run(*cmd):
+    ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def split_addr(a):
+    ""
+    host, _, port = a.rpartition(":")
+    host = host.strip("[]").split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        host = str(ip)
+    except ValueError:
+        pass
+    return host, port
+
+
+def loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def listening():
+    ""
+    text = run("ss", "-tulnH")
+    if text is None:
+        return None
+    out = set()
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 5:
+            out.add((f[0], split_addr(f[4])[1]))
+    return out
+
+
+def exe(pid):
+    try:
+        name = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return ""
+    return clean(name[:-len(" (deleted)")] if name.endswith(" (deleted)") else name)
+
+
+def clean(name):
+    return NAME.sub("_", name.replace('\\"', '"'))[:32]
+
+
+def parse(text, listen):
+    ""
+    out, bad = {}, 0
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) < 5 or f[0] not in ("tcp", "udp"):
+            bad += bool(line.strip())
+            continue
+        proto, local, peer = f[0], f[3], f[4]
+        host, port = split_addr(peer)
+        if not host or not port.isdigit() or loopback(host) or (proto, split_addr(local)[1]) in listen:
+            continue
+        m = USERS.search(line)
+        proc, path = (clean(m.group(1)), exe(m.group(2))) if m else ("", "")
+        key = (proc, path, host, port, proto)
+        out[key] = out.get(key, 0) + 1
+    return out, bad
+
+
+def cache_path(p):
+    return p + ".rdns"
+
+
+def load_cache(p, now):
+    ""
+    fd = _decisions._open(cache_path(p), _decisions._READ)
+    if fd is None:
+        return {}
+    try:
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+            d = json.loads(fh.read(MAX_CACHE * 300) or "{}")
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+    for k, v in d.items():
+        if not isinstance(v, dict):
+            continue
+        name, t = v.get("name"), v.get("t")
+        if (isinstance(name, str) and (name == "" or HOST.match(name)) and isinstance(t, (int, float))
+                and now - CACHE_DAYS * 86400 <= t <= now + 3600):
+            out[k] = {"name": name, "t": t}
+    return out
+
+
+def sweep_tmp(p, now):
+    ""
+    d, base = os.path.split(cache_path(p))
+    try:
+        names = os.listdir(d or ".")
+    except OSError:
+        return
+    for n in names:
+        if n.startswith(base + ".") and n.endswith(".tmp"):
+            f = os.path.join(d, n)
+            try:
+                if now - os.lstat(f).st_mtime > 3600:
+                    os.unlink(f)
+            except OSError:
+                pass
+
+
+def save_cache(p, cache, now):
+    tmp = f"{cache_path(p)}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(p)), mode=0o700, exist_ok=True)
+        sweep_tmp(p, now)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fd = _decisions._open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if fd is None:
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(dict(list(cache.items())[-MAX_CACHE:]), fh)
+        os.replace(tmp, cache_path(p))
+    except OSError:
+        pass
+
+
+def lookup(host):
+    ""
+    try:
+        r = subprocess.run(["getent", "hosts", host], capture_output=True, text=True, timeout=LOOKUP_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 2:
+        return ""
+    if r.returncode != 0:
+        return None
+    f = r.stdout.split()
+    name = f[1].rstrip(".").lower() if len(f) > 1 else ""
+    return name if HOST.match(name) else ""
+
+
+def sample(now=None):
+    now = time.time() if now is None else now
+    p = checked_log()
+    listen = listening()
+    est = run("ss", "-tunpH", "state", "established") if listen is not None else None
+    if est is None:
+        print("egress: ss failed (" + ("listening sockets" if listen is None else "established sockets")
+              + "), no sample written", file=sys.stderr)
+        return 1
+    conns, bad = parse(est, listen)
+    cache = load_cache(p, now) if p else {}
+    asked = 0
+    dests = []
+    for (proc, path, host, port, proto), n in sorted(conns.items(), key=lambda kv: -kv[1]):
+        if host not in cache and asked < MAX_LOOKUPS:
+            asked += 1
+            name = lookup(host)
+            if name is not None:
+                cache[host] = {"name": name, "t": now}
+        d = {"proc": proc, "exe": path, "host": host, "port": int(port), "proto": proto, "n": n}
+        if cache.get(host, {}).get("name"):
+            d["rdns"] = cache[host]["name"]
+        dests.append(d)
+    line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "dest": dests[:MAX_DEST],
+            "dropped": max(0, len(dests) - MAX_DEST), "bad": bad}
+    if p and asked:
+        save_cache(p, cache, now)
+    ok = append(p, line) if p else False
+    print(f"egress: {len(dests)} destination(s), {sum(conns.values())} socket(s)"
+          + (f", {line['dropped']} dropped" if line["dropped"] else "") + ("" if ok else " (not written)"))
+    return 0 if ok or p is None else 1
+
+
+def append(p, line, max_bytes=None):
+    ""
+    max_bytes = MAX_BYTES if max_bytes is None else max_bytes
+    data = (json.dumps(line, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    try:
+        try:
+            fd = os.open(p, _decisions._WRITE, 0o600)
+        except FileNotFoundError:
+            os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+            fd = os.open(p, _decisions._WRITE, 0o600)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not _decisions._ours(st):
+            return False
+        if st.st_mode & 0o777 != 0o600:
+            os.fchmod(fd, 0o600)
+        if st.st_size > max_bytes:
+            fd = _decisions._rotate(p, fd, st)
+        os.write(fd, data)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def since_s(text):
+    m = re.fullmatch(r"(\d+)([dh])", text or "")
+    if not m:
+        raise SystemExit("egress: --since takes Nd or Nh (7d, 24h)")
+    return int(m.group(1)) * (86400 if m.group(2) == "d" else 3600)
+
+
+def ts(s):
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def profile(window, now=None):
+    ""
+    now = time.time() if now is None else now
+    p = checked_log()
+    lines, bad = _decisions.read(p) if p else ([], 0)
+    seen, ever = {}, {}
+    samples = dropped = 0
+    oldest = None
+    for l in lines:
+        t = ts(l.get("ts"))
+        if t is None or not isinstance(l.get("dest"), list):
+            continue
+        oldest = t if oldest is None else min(oldest, t)
+        inside = t >= now - window
+        if inside:
+            samples += 1
+            dropped += l.get("dropped") if isinstance(l.get("dropped"), int) else 0
+        for d in l["dest"]:
+            if not isinstance(d, dict):
+                continue
+            k = (d.get("proc") or "(not ours)", d.get("exe") or "", str(d.get("host")), str(d.get("port")),
+                 d.get("proto") or "")
+            ever[k] = min(ever.get(k, t), t)
+            if not inside:
+                continue
+            e = seen.setdefault(k, {"first": t, "last": t, "samples": 0, "rdns": ""})
+            e["first"], e["last"] = min(e["first"], t), max(e["last"], t)
+            e["samples"] += 1
+            e["rdns"] = d.get("rdns") or e["rdns"]
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(t))
+    print(f"egress profile: {samples} sample(s) in the last {window // 3600} h, {len(seen)} destination(s)"
+          + (f", {dropped} dropped" if dropped else "") + (f", {bad} unreadable line(s)" if bad else ""))
+    if oldest is None or oldest > now - window:
+        print("the log covers less than asked: " + (f"since {fmt(oldest)}, {int((now - oldest) // 3600)} h"
+                                                     if oldest is not None else "it is empty"))
+    by = {}
+    for k, e in seen.items():
+        by.setdefault(k[:2], []).append((k, e))
+    for (proc, path), rows in sorted(by.items()):
+        print(f"\n{proc}" + (f" ({path})" if path and path != proc else ""))
+        for k, e in sorted(rows, key=lambda r: -r[1]["samples"]):
+            where = f"{e['rdns'] or k[2]}:{k[3]}/{k[4]}" + (f" [{k[2]}]" if e["rdns"] else "")
+            print(f"  {where:<60} {fmt(e['first'])} – {fmt(e['last'])}  {e['samples']:>5}")
+    new = sorted((k, e) for k, e in seen.items() if ever[k] >= now - 86400)
+    print(f"\nnew since yesterday: {len(new)}")
+    for k, e in new:
+        print(f"  {k[0]}: {e['rdns'] or k[2]}:{k[3]}/{k[4]}  first {fmt(e['first'])}")
+    return 0
+
+
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    if a[:1] == ["sample"]:
+        return sample()
+    if a[:1] == ["profile"]:
+        if "--since" in a:
+            i = a.index("--since") + 1
+            return profile(since_s(a[i] if i < len(a) else ""))
+        return profile(since_s("7d"))
+    print(__doc__.split("\n\n")[1])
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

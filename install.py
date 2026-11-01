@@ -39,6 +39,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -53,6 +54,28 @@ NO_BUILD = ("needs its full build command (build=COMMAND, run from the repositor
 REPO_ONLY = {"README.md", "CONTRIBUTING.md", "install.py", "install.sh"}   # this repository's, not the kit's
 THEIRS = ("done.json", "works-for.md")                                      # written once, never replaced
 STAMP, WHATS_NEW, DONE_DEFAULT = "VERSION", "WHATS-NEW.md", "done.default.json"
+# A user timer, every 5 minutes: `egress sample` records what this account's processes talk to, on this machine only,
+# so a Claude left alone has a record of its normal traffic to read with `egress profile`.
+EGRESS_UNITS = {
+    "iphtah-kit-egress.service": """[Unit]
+Description=Iphtah kit: egress sample, what this account's processes talk to
+
+[Service]
+Type=oneshot
+Nice=19
+TimeoutStartSec=60
+ExecStart=%h/{kit}/bin/egress sample
+""",
+    "iphtah-kit-egress.timer": """[Unit]
+Description=Iphtah kit: every 5 minutes, one snapshot of outgoing connections
+
+[Timer]
+OnCalendar=*-*-* *:00/5:20
+
+[Install]
+WantedBy=timers.target
+""",
+}
 BLOCK_START = "<!-- iphtah-kit: start (written by install.py; edit outside this block, it is refreshed) -->"
 BLOCK_END = "<!-- iphtah-kit: end -->"
 CONTEXT_LINE = ("Your client's own context file, kept in the client's repository (how its team works, its rules, its "
@@ -408,6 +431,10 @@ def show_install(p, home):
             print(diff(path, p["old_" + key], p["new_" + key]), end="")
         else:
             print(f"= {path} unchanged")
+    for path, text in p["egress"].items():
+        if read(path) != text:
+            changes += 1
+            print(f"{'+' if read(path) is None else '~'} {path} (a user timer, every 5 minutes: what this account's processes talk to, kept on this machine only)")
     if p["client"] is None:
         if p["existing"]:
             print(f"= client file kept: {', '.join(p['existing'])} (yours)")
@@ -416,6 +443,34 @@ def show_install(p, home):
                   "--client NAME --login LOGIN --repo NAME=PATH[,github=OWNER/REPO][,base=main][,build=CMD], or "
                   "--client-file PATH, any time.")
     return changes
+
+
+def egress_units(home, src):
+    """{path: text} of the timer's units, or {} when this kit copy has no egress tool."""
+    if not os.path.isfile(os.path.join(src, "bin", "egress")):
+        return {}
+    return {os.path.join(home, ".config/systemd/user", name): text.format(kit=KIT) for name, text in EGRESS_UNITS.items()}
+
+
+def systemctl_user(home, *args):
+    """Only for the real home: a --home install (a test, a copy) writes the units and touches no running systemd."""
+    if (os.path.realpath(home) != os.path.realpath(os.path.expanduser("~")) or not shutil.which("systemctl")
+            or os.environ.get("IPHTAH_KIT_NO_SYSTEMD")):
+        return None
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def enable_egress_timer(home):
+    r = systemctl_user(home, "daemon-reload")
+    r = r and systemctl_user(home, "enable", "--now", "iphtah-kit-egress.timer")
+    if r is not None and r and r.returncode == 0:
+        print("egress timer on: `egress profile` shows what this account talks to. It runs while you are logged in, "
+              "unless you run: loginctl enable-linger")
+    else:
+        print("! egress timer not started (no user systemd here?): the units are written; `egress sample` also runs by hand.")
 
 
 def backup(home, p, role):
@@ -453,6 +508,7 @@ def write_text(path, text):
 def do_install(a, home, src):
     a.role = a.role or installed_role(home) or ROLES[0]
     p = plan_install(a, home, src)
+    p["egress"] = egress_units(home, src)
     changes = show_install(p, home)
     if a.dry_run:
         print("\n(dry run: nothing written)")
@@ -482,6 +538,10 @@ def do_install(a, home, src):
         write_text(p["md_path"], p["new_md"])
     if p["old_st"] != p["new_st"]:
         write_text(p["st_path"], p["new_st"])
+    if any(read(path) != text for path, text in p["egress"].items()):
+        for path, text in p["egress"].items():
+            write_text(path, text)
+        enable_egress_timer(home)
     print("\nwritten." + (f" Your CLAUDE.md and settings.json as they were: {folder}" if folder else ""))
     return 0
 
@@ -561,6 +621,10 @@ def plan_uninstall(home):
 def do_uninstall(a, home):
     plan, folder = plan_uninstall(home)
     root = os.path.join(home, KIT)
+    units = [os.path.join(home, ".config/systemd/user", n) for n in EGRESS_UNITS]
+    units = [u for u in units if os.path.isfile(u)]
+    for u in units:
+        plan[u] = None
     for path, text in sorted(plan.items()):
         if text is None:
             print(f"- {path}")
@@ -580,6 +644,8 @@ def do_uninstall(a, home):
     if a.dry_run:
         print("\n(dry run: nothing written)")
         return 0
+    if units:
+        systemctl_user(home, "disable", "--now", "iphtah-kit-egress.timer")
     for path, text in sorted(plan.items()):
         if text is None:
             os.remove(path)
@@ -590,6 +656,12 @@ def do_uninstall(a, home):
             os.rmdir(dirpath)
         elif not os.listdir(dirpath):
             os.rmdir(dirpath)
+    if units:
+        systemctl_user(home, "daemon-reload")
+        for d in (".config/systemd/user", ".config/systemd", ".config"):
+            d = os.path.join(home, d)
+            if os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
     print("\nremoved." + (f" The backups stay in {os.path.dirname(folder)}" if folder else ""))
     return 0
 

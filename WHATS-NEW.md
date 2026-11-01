@@ -2,6 +2,17 @@
 
 One line per kit file an update changed, newest first; what the person may do with it, if they wish: `feedback.md`.
 
+## Since method e8879958 (2026-11-01T17:53:45+00:00, with local changes), now method e8879958 (2026-11-01T17:53:45+00:00, with local changes)
+
+- install.py (changed, +2 −1 lines): in « systemctl_user »
+
+## Since method e8879958 (2026-11-01T17:53:45+00:00), now method e8879958 (2026-11-01T17:53:45+00:00, with local changes)
+
+- README.md (changed, +1 −0 lines): in « First steps, with your Claude »; new text: « The installer also sets up a user timer, `egress sample` every 5 minutes: what this account's proce… »
+- bin/egress (new, 349 lines)
+- install.py (changed, +71 −0 lines): in « show_install », « do_install », « do_uninstall »
+- tools.md (changed, +2 −0 lines): in « Notes »; new text: « `egress`: what this account's processes talk to, sampled every 5 minutes by a user timer the instal… »
+
 ## Since method 3036806b (2026-10-25T13:21:05+00:00), now method e8879958 (2026-11-01T17:53:45+00:00)
 
 - bin/_machine.py (changed, +50 −1 lines): in « limit », « run_queued_param »

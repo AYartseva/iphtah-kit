@@ -30,6 +30,8 @@ brief (`templates/scout-brief.txt`) is there too: your Claude fills it by hand, 
   `America/New_York`), Paris time when it is unset. Set it once, before the first loop: the loop lines hold no zone.
 - `acts:vela` in a loop line is a label for « your Claude acts on this »; it is not a name your Claude must carry.
 
+`egress`: what this account's processes talk to, sampled every 5 minutes by a user timer the installer sets up (`iphtah-kit-egress.timer`, shown before you confirm, removed by `--uninstall`). `egress profile` lists destinations per process, and those first seen in the last 24 hours. Nothing leaves your machine: no payloads, no command lines. Useful for a Claude left alone.
+
 ## Optional
 
 - `--with-map`: the product map's page (`map-view`). The map itself is plain JSON files in your repository
