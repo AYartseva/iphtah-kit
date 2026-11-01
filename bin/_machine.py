@@ -10,6 +10,10 @@ import sys
 
 DEFAULT_FILE = "~/.claude/iphtah-kit/machine.json"
 
+CAPPED_ENV = "IPHTAH_CAPPED"
+CAP_NO_ROOM = 87
+CAP_NO_RESULT = 86
+
 FORMULAS = {
     "building_agents": "max(1, cores - 1)",
     "quiet_load": "cores",
@@ -156,8 +160,53 @@ def limit(name, path=None):
     return machine_limits(path)[name]
 
 
+RUN_QUEUED_FALLBACK = {
+    "run_queued_default_gib": 4,
+    "run_queued_floor_gib": 1,
+    "run_queued_room_wait_s": 300,
+}
+DISK_LOW_FALLBACK = {
+    "disk_low_gib": 10,
+}
+PARAM_FALLBACK = {**RUN_QUEUED_FALLBACK, **DISK_LOW_FALLBACK}
+_SAID = set()
+
+
+def param(name, path=None):
+    ""
+    fallback = PARAM_FALLBACK[name]
+    try:
+        data = read_file(path)
+        if data is None:
+            return fallback
+        v = (data.get("overrides") or {}).get(name)
+    except (OSError, ValueError, AttributeError) as e:
+        v, bad = None, f"the machine file cannot be read ({e.__class__.__name__})"
+    else:
+        bad = None
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0 or v != v
+                              or v == float("inf")):
+            bad = f"{name} = {v!r} is not a positive number"
+    if v is None or bad:
+        if bad and (name, bad) not in _SAID:
+            _SAID.add((name, bad))
+            print(f"machine file: {bad}: using {fallback}", file=sys.stderr, flush=True)
+        return fallback
+    return v
+
+
+def run_queued_param(name, path=None):
+    ""
+    if name not in RUN_QUEUED_FALLBACK:
+        raise KeyError(name)
+    return param(name, path)
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "get" and sys.argv[2] in FORMULAS:
         print(limit(sys.argv[2]))
         sys.exit(0)
-    sys.exit("usage: _machine.py get <" + "|".join(FORMULAS) + ">")
+    if len(sys.argv) == 3 and sys.argv[1] == "get" and sys.argv[2] in DISK_LOW_FALLBACK:
+        print(param(sys.argv[2]))
+        sys.exit(0)
+    sys.exit("usage: _machine.py get <" + "|".join([*FORMULAS, *DISK_LOW_FALLBACK]) + ">")

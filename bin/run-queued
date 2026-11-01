@@ -3,7 +3,11 @@
 """
 import fcntl
 import os
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -19,6 +23,9 @@ def _log(*args, **kw):
         pass
 
 KINDS = ("maven", "vitest", "py", "pysuite")
+CAPPED_KINDS = ("maven", "vitest", "py")
+HELPER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "_build_where.py")
+SELF_CAPPING = ("merge-check", "round", "mutant-check")
 
 
 def slots_for(kind):
@@ -82,6 +89,67 @@ def held(kind):
     return fd
 
 
+def self_capping(command):
+    ""
+    base = os.path.basename(command[0])
+    if base in SELF_CAPPING:
+        return True
+    return (base.startswith("python") and len(command) > 2 and os.path.basename(command[1]) == "_build_where.py"
+            and command[2] in ("capped", "admit"))
+
+
+def run_capped(kind, command, slot):
+    ""
+    if self_capping(command):
+        return None
+    if not os.path.isfile(HELPER):
+        print("run-queued: not capped: no _build_where.py beside it (a kit copy)", file=sys.stderr, flush=True)
+        return None
+    work = tempfile.mkdtemp(prefix="run-queued-")
+    result = os.path.join(work, "cap.result")
+    p = None
+    try:
+        p = subprocess.Popen([sys.executable, HELPER, "capped", os.getcwd(), "--cmd", f"run-queued {kind}",
+                              "--for", "run-queued", "--record", "--result-file", result, "--", *command],
+                             pass_fds=(slot,))
+        got = []
+
+        def forward(signum, frame):
+            got.append(signum)
+            p.send_signal(signum)
+        old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        try:
+            rc = p.wait()
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
+        if rc < 0:
+            rc = 128 - rc
+        if not os.path.exists(result) and rc != _machine.CAP_NO_RESULT and not got:
+            print(f"run-queued: not capped: the memory-cap helper failed before the command (exit {rc}); "
+                  "running it without", file=sys.stderr, flush=True)
+            return None
+        if rc == _machine.CAP_NO_RESULT:
+            print("run-queued: not run: the memory-cap helper could not write its result", file=sys.stderr, flush=True)
+        else:
+            try:
+                with open(result) as fh:
+                    res = dict(l.rstrip("\n").split("=", 1) for l in fh if "=" in l)
+            except OSError:
+                res = {}
+            if res.get("no_room"):
+                print("run-queued: not run: no memory room for it after waiting (the need and the room are said "
+                      "above); try again when a build has ended", file=sys.stderr, flush=True)
+            elif res.get("capped") == "0":
+                print(f"run-queued: not capped: {res.get('note', '?')}", file=sys.stderr, flush=True)
+        return rc
+    finally:
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.wait()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     a = sys.argv[1:]
     if len(a) == 2 and a[0] == "--held" and a[1] in KINDS:
@@ -93,6 +161,10 @@ def main():
     slot = acquire(kind)
     os.set_inheritable(slot, True)
     os.environ[HELD_ENV] = f"{kind}:{slot}"
+    if kind in CAPPED_KINDS and not os.environ.get(_machine.CAPPED_ENV):
+        rc = run_capped(kind, command, slot)
+        if rc is not None:
+            sys.exit(rc)
     try:
         os.execvp(command[0], command)
     except FileNotFoundError:

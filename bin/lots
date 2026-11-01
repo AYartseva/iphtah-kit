@@ -9,6 +9,7 @@ import os
 import re
 import statistics
 import sys
+from zoneinfo import ZoneInfo
 
 TAXONOMY = {
     "kind": ["feature", "fix", "ticket", "look-and-feel", "contract", "migration", "test", "tooling", "research",
@@ -52,15 +53,106 @@ def load(client):
     return json.load(open(p)) if os.path.exists(p) else {"lots": {}}
 
 
+STAMPED = []
+
+
 def save(client, d):
     p = ledger_path(client)
     tmp = p + ".tmp"
     json.dump(d, open(tmp, "w"), indent=2, ensure_ascii=False)
     os.replace(tmp, p)
+    while STAMPED:
+        print(STAMPED.pop(0))
+
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def at_paris(naive, clock=None):
+    ""
+    first, second = naive.replace(tzinfo=PARIS, fold=0), naive.replace(tzinfo=PARIS, fold=1)
+    back = lambda t: t.astimezone(dt.timezone.utc).astimezone(PARIS).replace(tzinfo=None)
+    if first.utcoffset() == second.utcoffset() or back(first) != naive or back(second) != naive:
+        return first
+    clock = clock or dt.datetime.now(dt.timezone.utc)
+    return min((first, second), key=lambda t: abs((t - clock).total_seconds()))
 
 
 def ts(s):
-    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    ""
+    if not isinstance(s, str):
+        raise ValueError(f"not a time: {type(s).__name__}")
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return t if t.tzinfo else at_paris(t)
+
+
+def has_zone(s):
+    ""
+    if not isinstance(s, str):
+        raise ValueError(f"not a time: {type(s).__name__}")
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).tzinfo is not None
+
+
+def stamp_zone(s):
+    ""
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00")) if isinstance(s, str) else None
+    if t is None:
+        raise ValueError(f"not a time: {type(s).__name__}")
+    if t.tzinfo:
+        return s, False
+    return at_paris(t).isoformat(), True
+
+
+CLOSING = ("ready", "merged", "deployed")
+
+
+def blank(v):
+    ""
+    return v is None or v == ""
+
+
+def is_time(v):
+    ""
+    try:
+        ts(v)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return True
+
+
+def started_text(lot):
+    ""
+    v = lot.get("started") if isinstance(lot, dict) else None
+    return v if isinstance(v, str) else ""
+
+
+NOTE_CAP = 10
+
+
+def start_of(lid, lot, notes):
+    ""
+    v = lot.get("started")
+    if blank(v):
+        return None
+    try:
+        t = ts(v)
+    except (ValueError, TypeError, OverflowError):
+        notes.append((lid, f"started {str(v)[:60]!r} is not a time: its age is unknown"))
+        return None
+    if not has_zone(v):
+        notes.append((lid, f"started {v!r} has no time zone: read as Europe/Paris"))
+    return t
+
+
+def warn_rows(notes, cap=NOTE_CAP):
+    ""
+    rows = {}
+    for lid, text in notes:
+        rows.setdefault(lid, []).append(text)
+    for lid, texts in list(rows.items())[:cap]:
+        print(f"lots: warning: lot {lid}: {'; '.join(texts)}", file=sys.stderr)
+    if len(rows) > cap:
+        print(f"lots: warning: and {len(rows) - cap} more row(s) like these", file=sys.stderr)
 
 
 def agent_files(project):
@@ -536,53 +628,364 @@ def merged_at(cwd, ref, head, cap=300):
     return _utc(when) if when else None
 
 
-def is_closed(lot):
+def is_closed(lot, notes=None, lid="?"):
     ""
-    return bool(lot.get("ready") or lot.get("merged") or lot.get("deployed"))
-
-
-def sweep(d, client, now=None):
-    ""
-    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")
-    repos = (json.load(open(pj)).get("repos") or {}) if os.path.exists(pj) else {}
-    now = now or dt.datetime.now(dt.timezone.utc)
-    said = []
-    for lid, lot in d["lots"].items():
-        if is_closed(lot) or is_meeting(lot):
+    if not isinstance(lot, dict):
+        return False
+    closed = False
+    for k in CLOSING:
+        v = lot.get(k)
+        if blank(v):
             continue
-        branch = lot.get("branch") or lid
-        for name, r in repos.items():
-            path = os.path.expanduser(r.get("path") or "") if isinstance(r, dict) else ""
-            if not path or not os.path.isdir(path):
+        if is_time(v):
+            closed = True
+        elif notes is not None:
+            notes.append((lid, f"{k} {str(v)[:60]!r} is not a time: it does not close the lot"))
+    return closed
+
+
+SENSOR_DEFAULTS = {"gh_timeout_s": 20, "pr_limit": 1000, "sweep_days": 7, "deploy_window_h": 6}
+HEX = re.compile(r"[0-9a-f]{7,64}")
+REPO_NAME = re.compile(r"[\w.-]+/[\w.-]+")
+MERGE_SHA = re.compile(r"(?:merge commit |in commit |lots sweep: )([0-9a-f]{8,64})\b")
+
+
+def client_project(client):
+    pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{client}/project.json")
+    return json.load(open(pj)) if os.path.exists(pj) else {}
+
+
+def sensor_settings(project):
+    ""
+    mine = project.get("lots_sensors")
+    mine = mine if isinstance(mine, dict) else {}
+    return {k: mine[k] if type(mine.get(k)) is int and mine[k] > 0 else v for k, v in SENSOR_DEFAULTS.items()}
+
+
+def pr_row(x):
+    ""
+    if not isinstance(x, dict) or type(x.get("number")) is not int:
+        return None
+    head, base, oid, at = (x.get(k) for k in ("headRefName", "baseRefName", "headRefOid", "mergedAt"))
+    if not (isinstance(head, str) and isinstance(base, str) and isinstance(oid, str) and HEX.fullmatch(oid)):
+        return None
+    try:
+        if not has_zone(at):
+            return None
+    except (ValueError, TypeError, OverflowError):
+        return None
+    commit = x.get("mergeCommit")
+    commit = commit.get("oid") if isinstance(commit, dict) else None
+    return {"number": x["number"], "head": head, "base": base, "oid": oid, "at": at,
+            "fork": x.get("isCrossRepository") is not False,
+            "commit": commit if isinstance(commit, str) and HEX.fullmatch(commit) else None}
+
+
+def gh_merged_prs(gh, since, limit, timeout):
+    ""
+    import subprocess
+    stamp = since.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        r = subprocess.run(["gh", "pr", "list", "-R", gh, "--state", "merged", "--search", f"merged:>={stamp}",
+                            "--limit", str(limit), "--json",
+                            "number,headRefName,baseRefName,headRefOid,mergedAt,mergeCommit,isCrossRepository"],
+                           capture_output=True, text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"gh on {gh}: no answer in {timeout} s", True
+    except OSError as e:
+        return None, f"gh on {gh}: could not run ({e.__class__.__name__})", True
+    if r.returncode:
+        why = (r.stderr or "no message").strip().splitlines() or ["no message"]
+        return None, f"gh on {gh}: exit {r.returncode} ({why[-1][:120]})", False
+    try:
+        answer = json.loads(r.stdout)
+    except (ValueError, RecursionError):
+        return None, f"gh on {gh}: unreadable answer", False
+    if not isinstance(answer, list):
+        return None, f"gh on {gh}: answered {type(answer).__name__}, not a list", False
+    rows = [pr_row(x) for x in answer]
+    good = [x for x in rows if x]
+    gaps = []
+    if len(good) < len(rows):
+        gaps.append(f"{len(rows) - len(good)} row(s) unreadable, skipped")
+    if len(rows) >= limit:
+        gaps.append(f"the list stopped at its limit of {limit}: older merges not checked")
+    return good, (f"gh on {gh}: " + "; ".join(gaps)) if gaps else None, False
+
+
+def site_version(site):
+    ""
+    return _load_tool("morning-prep").version_of(site)
+
+
+def no_sensors():
+    return {"prs": {}, "sites": {}, "gaps": [], "not_read": set(), "deploy_window_h": SENSOR_DEFAULTS["deploy_window_h"]}
+
+
+def read_sensors(client, since=None, now=None):
+    ""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    out = no_sensors()
+    try:
+        project = client_project(client)
+        conf = sensor_settings(project)
+        out["deploy_window_h"] = conf["deploy_window_h"]
+        since = since or now - dt.timedelta(days=conf["sweep_days"])
+        unreachable = False
+        for name, r in (project.get("repos") or {}).items():
+            r = r if isinstance(r, dict) else {}
+            gh = r.get("github")
+            if isinstance(gh, str) and REPO_NAME.fullmatch(gh):
+                if unreachable:
+                    out["gaps"].append(f"gh on {gh}: not asked, gh was out of reach")
+                    out["not_read"].add(name)
+                else:
+                    rows, gap, unreachable = gh_merged_prs(gh, since, conf["pr_limit"], conf["gh_timeout_s"])
+                    if gap:
+                        out["gaps"].append(gap)
+                    if rows is None:
+                        out["not_read"].add(name)
+                    else:
+                        out["prs"][name] = rows
+            if isinstance(r.get("site"), str) and r["site"]:
+                v = site_version(r["site"])
+                if isinstance(v, dict):
+                    out["sites"][name] = v
+                else:
+                    out["gaps"].append(f"the site of {name} could not be read: `deployed` not checked")
+    except Exception as e:
+        out["gaps"].append(f"sensors stopped early ({e.__class__.__name__}: {str(e)[:120]})")
+    return out
+
+
+def pr_proof(lid, lot, started, sensors, repos):
+    ""
+    branch = lot.get("branch") or lid
+    found, why = [], []
+    if started is None:
+        return None, why
+    for name, rows in sensors["prs"].items():
+        r = repos.get(name) if isinstance(repos.get(name), dict) else {}
+        path = os.path.expanduser(r.get("path") or "")
+        for p in rows:
+            if p["head"] != branch or p["fork"] or ts(p["at"]) < started:
                 continue
-            head = _git(path, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
-            if not head:
-                continue
-            fp = fork_point(path, branch)
-            if not fp or fp == head or not _is_ancestor(path, fp, head):
-                continue
-            started = lot.get("started")
-            ct = _git(path, "log", "-1", "--format=%ct", head).stdout.strip()
-            if started and ct and int(ct) < ts(started).timestamp():
-                continue
-            base = r.get("base") or "main"
-            hits = []
-            for ref in (f"refs/remotes/origin/{base}",):
-                if _git(path, "rev-parse", "--verify", "-q", ref).returncode == 0 and _is_ancestor(path, head, ref):
-                    hits.append((merged_at(path, ref, head), ref))
-            if not hits:
-                continue
-            known = sorted(h for h in hits if h[0])
-            when, ref = known[0] if known else (None, hits[0][1])
-            lot["merged"] = when or now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            lot["merged_how"] = (f"lots sweep: {head[:8]} of branch {branch} found in {ref} ({name})"
-                                 + ("" if when else "; the time is the sweep's, the reflog had none"))
-            if not lot.get("shape"):
-                lot["shape"] = count_shape([(name, path, fp, f"from where « {branch} » started (its reflog)", head)])
-            said.append(f"lot {lid} closed: branch {branch} @ {head[:8]} is in {ref.split('/', 2)[-1]} "
-                        f"(merged {lot['merged']}, {lot['shape']['files']} files)")
-            break
+            local = _git(path, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip() \
+                if path and os.path.isdir(path) else ""
+            if p["base"] != (r.get("base") or "main"):
+                why.append(f"PR #{p['number']} went into {p['base'][:60]}, not the base")
+            elif local and local != p["oid"] and not _is_ancestor(path, local, p["oid"]):
+                why.append(f"the branch's head {local[:8]} is not in PR #{p['number']}")
+            else:
+                found.append(dict(p, gh=r.get("github")))
+    found.sort(key=lambda p: ts(p["at"]))
+    if found:
+        late = undelivered(branch, started, sensors, repos)
+        if late:
+            return None, why + [f"the branch is not delivered in {', '.join(late)}"]
+    return (dict(found[0], others=len(found) - 1) if found else None), why
+
+
+def undelivered(branch, started, sensors, repos):
+    ""
+    late = []
+    for name, r in repos.items():
+        path = os.path.expanduser(r.get("path") or "") if isinstance(r, dict) else ""
+        if not path or not os.path.isdir(path):
+            continue
+        head = _git(path, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+        if not head:
+            continue
+        ct = _git(path, "log", "-1", "--format=%ct", head).stdout.strip()
+        if started and ct and int(ct) < started.timestamp():
+            continue
+        base = r.get("base") or "main"
+        if _is_ancestor(path, head, f"refs/remotes/origin/{base}"):
+            continue
+        if not any(p["head"] == branch and not p["fork"] and p["base"] == base and (not started or ts(p["at"]) >= started)
+                   and (p["oid"] == head or _is_ancestor(path, head, p["oid"])) for p in sensors["prs"].get(name, [])):
+            late.append(name)
+    return late
+
+
+def pr_how(tool, p):
+    commit = f"merge commit {p['commit']}" if p["commit"] else "merge commit not given"
+    return (f"{tool}: PR {p['gh']}#{p['number']} mergedAt, {commit}"
+            + (f"; the first of {p['others'] + 1} merged PRs of the branch" if p["others"] else ""))
+
+
+def repos_with_branch(repos, branch, cache):
+    ""
+    out = []
+    for name, r in repos.items():
+        path = os.path.expanduser(r.get("path") or "") if isinstance(r, dict) else ""
+        if not path or not os.path.isdir(path):
+            continue
+        if path not in cache:
+            cache[path] = set(_git(path, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads").stdout.split("\n"))
+        if branch in cache[path]:
+            out.append((name, r, path))
+    return out
+
+
+def ancestry_proof(path, branch, started, base):
+    ""
+    head = _git(path, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+    if not head:
+        return None
+    fp = fork_point(path, branch)
+    if not fp or fp == head or not _is_ancestor(path, fp, head):
+        return None
+    ct = _git(path, "log", "-1", "--format=%ct", head).stdout.strip()
+    if started and ct and int(ct) < started.timestamp():
+        return None
+    ref = f"refs/remotes/origin/{base}"
+    if _git(path, "rev-parse", "--verify", "-q", ref).returncode or not _is_ancestor(path, head, ref):
+        return None
+    return head, fp, merged_at(path, ref, head), ref
+
+
+def deployed_proof(lid, lot, sensors, repos, now):
+    ""
+    if not is_time(lot.get("merged")):
+        return None
+    merged = ts(lot["merged"])
+    window = dt.timedelta(hours=sensors["deploy_window_h"])
+    sha = MERGE_SHA.search(str(lot.get("merged_how") or ""))
+    for name, v in sensors["sites"].items():
+        built, commit, keys = v.get("builtAt"), v.get("commit"), v.get("keys")
+        if not is_time(built) or not has_zone(built) or ts(built) < merged or ts(built) > now \
+                or ts(built) - merged > window:
+            continue
+        keys = keys if isinstance(keys, list) else []
+        by_key = lid in keys or (lot.get("mapRow") and lot["mapRow"] in keys)
+        r = repos.get(name) if isinstance(repos.get(name), dict) else {}
+        path = os.path.expanduser(r.get("path") or "")
+        by_commit = sha and isinstance(commit, str) and HEX.fullmatch(commit) and path and os.path.isdir(path) \
+            and _is_ancestor(path, sha.group(1), commit)
+        if by_key or by_commit:
+            return _utc(built), (f"the site of {name} serves commit {str(commit)[:8]}, built {_utc(built)}, which "
+                                 + ("names this lot in its keys" if by_key else f"holds {sha.group(1)[:8]}")
+                                 + "; live at the latest at that build")
+    return None
+
+
+def sweep(d, client, now=None, sensors=None):
+    ""
+    repos = client_project(client).get("repos") or {}
+    now = now or dt.datetime.now(dt.timezone.utc)
+    sensors = sensors or no_sensors()
+    said, notes, cache = [], [], {}
+    for lid, lot in d["lots"].items():
+        if not isinstance(lot, dict) or is_meeting(lot):
+            continue
+        was_closed = is_closed(lot)
+        if not is_time(lot.get("merged")) and (blank(lot.get("merged")) or not was_closed):
+            sweep_merged(lid, lot, was_closed, sensors, repos, now, said, notes, cache)
+        if blank(lot.get("deployed")):
+            live = deployed_proof(lid, lot, sensors, repos, now)
+            if live:
+                lot["deployed"], lot["deployed_how"] = live[0], f"lots sweep: {live[1]}"
+                said.append(f"lot {lid} deployed {live[0]}: {live[1]}")
+    warn_rows(notes)
     return said
+
+
+def sweep_merged(lid, lot, was_closed, sensors, repos, now, said, notes, cache):
+    ""
+    mine = []
+    started = start_of(lid, lot, mine)
+    if not blank(lot.get("started")) and started is None:
+        notes += mine
+        return
+    pr, _ = pr_proof(lid, lot, started, sensors, repos)
+    if pr:
+        lot["merged"], lot["merged_how"] = _utc(pr["at"]), pr_how("lots sweep", pr)
+        said.append(f"lot {lid} {'merged' if was_closed else 'closed'}: PR #{pr['number']} merged {lot['merged']}")
+        return
+    branch = lot.get("branch") or lid
+    for name, r, path in repos_with_branch(repos, branch, cache):
+        proof = ancestry_proof(path, branch, started, r.get("base") or "main")
+        if not proof or (was_closed and not proof[2]) or undelivered(branch, started, sensors, repos):
+            continue
+        head, fp, when, ref = proof
+        lot["merged"] = when or now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lot["merged_how"] = (f"lots sweep: {head[:8]} of branch {branch} found in {ref} ({name})"
+                             + ("" if when else "; the time is the sweep's, the reflog had none"))
+        if not lot.get("shape"):
+            lot["shape"] = count_shape([(name, path, fp, f"from where « {branch} » started (its reflog)", head)])
+        said.append(f"lot {lid} {'merged' if was_closed else 'closed'}: branch {branch} @ {head[:8]} is in "
+                    f"{ref.split('/', 2)[-1]} (merged {lot['merged']}, {lot['shape']['files']} files)")
+        break
+
+
+def backfill(d, client, month, sensors, now=None):
+    ""
+    repos = client_project(client).get("repos") or {}
+    now = now or dt.datetime.now(dt.timezone.utc)
+    tool = f"lots backfill, back-filled {now.astimezone(PARIS):%Y-%m-%d}"
+    lines, n, notes, cache = [], {}, [], {}
+
+    def count(k):
+        n[k] = n.get(k, 0) + 1
+    for lid, lot in d["lots"].items():
+        if not isinstance(lot, dict):
+            notes.append((lid, "no record: not checked"))
+            count("not checked: row unreadable")
+            continue
+        if is_meeting(lot):
+            continue
+        started = start_of(lid, lot, notes)
+        if started is None:
+            count("not checked: no readable start")
+            continue
+        if started.astimezone(PARIS).strftime("%Y-%m") != month:
+            continue
+        count("lots of the month")
+        pr, why = pr_proof(lid, lot, started, sensors, repos)
+        had = lot.get("merged")
+        if not blank(had):
+            if not is_time(had):
+                count("CONFLICT")
+                lines.append(f"CONFLICT {lid}: merged {str(had)[:60]!r} is no time"
+                             + (f", the PR says {_utc(pr['at'])}" if pr else "") + ": left as it is")
+            elif pr and ts(had) != ts(pr["at"]):
+                count("CONFLICT")
+                lines.append(f"CONFLICT {lid}: merged {had} in the ledger, {_utc(pr['at'])} from PR #{pr['number']}: "
+                             "left as it is")
+            else:
+                count("merged: already there")
+        elif pr:
+            lot["merged"], lot["merged_how"] = _utc(pr["at"]), pr_how(tool, pr)
+            count("merged: filled from a PR")
+            lines.append(f"merged {lid} {lot['merged']} ({lot['merged_how']})")
+        else:
+            branch = lot.get("branch") or lid
+            for name, r, path in repos_with_branch(repos, branch, cache):
+                proof = ancestry_proof(path, branch, started, r.get("base") or "main")
+                if proof and proof[2] and not undelivered(branch, started, sensors, repos):
+                    lot["merged"] = proof[2]
+                    lot["merged_how"] = (f"{tool}: in commit {proof[0]} of branch {branch}, found in {proof[3]} ({name}); "
+                                         "the time is when this clone first saw it there (its reflog), not the push")
+                    count("merged: filled from the branch")
+                    lines.append(f"merged {lid} {lot['merged']} ({lot['merged_how']})")
+                    break
+            else:
+                count("merged: blank, a PR refused" if why else "merged: blank, not checked" if sensors["not_read"]
+                      else "merged: blank, no proof")
+                lines += [f"blank {lid}: {w}" for w in why]
+        if blank(lot.get("deployed")):
+            live = deployed_proof(lid, lot, sensors, repos, now)
+            if live:
+                lot["deployed"], lot["deployed_how"] = live[0], f"{tool}: {live[1]}"
+                count("deployed: filled")
+                lines.append(f"deployed {lid} {live[0]} ({lot['deployed_how']})")
+            else:
+                count("deployed: blank, no dated proof")
+        else:
+            count("deployed: already there")
+    warn_rows(notes)
+    return lines, n
 
 
 def ledger_lock(client):
@@ -599,15 +1002,16 @@ def sweep_client(client, now=None):
     ""
     if not os.path.exists(ledger_path(client)):
         return []
+    sensors = read_sensors(client, now=now)
     lock = ledger_lock(client)
     try:
         d = load(client)
-        said = sweep(d, client, now)
+        said = sweep(d, client, now, sensors)
         if said:
             save(client, d)
-        return said
     finally:
         lock.close()
+    return said + [f"lots sweep: {g}" for g in sensors["gaps"]]
 
 
 def _load_tool(name):
@@ -684,16 +1088,16 @@ def fixed_costs(client, today=None):
     now = (today or dt.date.today()).strftime("%Y-%m")
     for item in sub.get("monthly_fixed_eur") or []:
         try:
-            y, mo = map(int, str(item["from"])[:7].split("-"))
+            y, mth = map(int, str(item["from"])[:7].split("-"))
         except (KeyError, ValueError):
             print(f"lots: {p}: monthly_fixed_eur item {item.get('label', '?')!r} has no valid « from » (YYYY-MM): "
                   "left out of the real cost", file=sys.stderr)
             continue
         until = item.get("until") or now
-        while f"{y:04d}-{mo:02d}" <= until:
-            k = f"{y:04d}-{mo:02d}"
+        while f"{y:04d}-{mth:02d}" <= until:
+            k = f"{y:04d}-{mth:02d}"
             out[k] = out.get(k, 0.0) + float(item.get("eur") or 0)
-            y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+            y, mth = (y + 1, 1) if mth == 12 else (y, mth + 1)
     return out
 
 
@@ -720,7 +1124,7 @@ def report(d, project, as_json=False, client=None, since=None):
     act = actuals(d, project)
     counts = defect_counts(client) if client else None
     rows = []
-    for lid, lot in sorted(d["lots"].items(), key=lambda kv: kv[1].get("started", "")):
+    for lid, lot in sorted(d["lots"].items(), key=lambda kv: started_text(kv[1])):
         a = act.get(lid) or {}
         rows.append({"id": lid, "class": lot.get("class"), "title": lot.get("title"),
                      "human_days": lot.get("human_days"), "source": lot.get("estimate_source"),
@@ -734,9 +1138,9 @@ def report(d, project, as_json=False, client=None, since=None):
                      "modules": len((lot.get("shape") or {}).get("modules") or []) if lot.get("shape") else None,
                      "review_rounds": a.get("review_rounds") if a.get("review_rounds") is not None
                      else lot.get("review_rounds")})
-    months = spread_real_cost(rows, {lid: lot.get("started") for lid, lot in d["lots"].items()}, fixed_costs(client))
+    months = spread_real_cost(rows, {lid: started_text(lot) for lid, lot in d["lots"].items()}, fixed_costs(client))
     if since:
-        rows = [r for r in rows if (d["lots"][r["id"]].get("started") or "") >= since]
+        rows = [r for r in rows if started_text(d["lots"][r["id"]]) >= since]
     if as_json:
         for r in rows:
             r["forecast"] = d["lots"][r["id"]].get("forecast")
@@ -891,7 +1295,7 @@ def protocol_arm(d, cls, t):
     key = (cls, t.get("kind"), t.get("layer"))
     n = {"A": 0, "B": 0}
     for lot in d["lots"].values():
-        if lot.get("protocol") in n and stratum(lot) == key and (lot.get("started") or "") >= PROTOCOL_START:
+        if lot.get("protocol") in n and stratum(lot) == key and started_text(lot) >= PROTOCOL_START:
             n[lot["protocol"]] += 1
     return ("A" if n["A"] <= n["B"] else "B"), n
 
@@ -906,7 +1310,7 @@ def cell(d, project, cls, type_=None):
     act = actuals(d, project)
     counts = {c: 0 for c in CELLS}
     for lid, lot in d["lots"].items():
-        if lot.get("class") != cls or lot.get("money") or (lot.get("started") or "") < EXPERIMENT_START:
+        if lot.get("class") != cls or lot.get("money") or started_text(lot) < EXPERIMENT_START:
             continue
         a = act.get(lid) or {}
         c = (family(lot.get("model") or a.get("main_model")), lot.get("effort") or a.get("main_effort"))
@@ -1087,15 +1491,20 @@ def p90s():
 STALE_DAYS = 3
 
 
-def open_lots(d, now=None):
+def open_lots(d, now=None, notes=None):
     ""
     now = now or dt.datetime.now(dt.timezone.utc)
+    notes = [] if notes is None else notes
     opened, stale = [], []
     for lid, lot in d["lots"].items():
-        if is_closed(lot):
+        if is_closed(lot, notes, lid):
             continue
-        started = lot.get("started")
-        (stale if started and (now - ts(started)).days >= STALE_DAYS else opened).append(lid)
+        if not isinstance(lot, dict):
+            notes.append((lid, f"the row is {type(lot).__name__}, not a lot record: kept as open"))
+            opened.append(lid)
+            continue
+        started = start_of(lid, lot, notes)
+        (stale if started and (now - started).days >= STALE_DAYS else opened).append(lid)
     return opened, stale
 
 
@@ -1104,7 +1513,9 @@ def over(d, project):
     act = actuals(d, project)
     lim = p90s()
     found = []
-    opened, stale = open_lots(d)
+    notes = []
+    opened, stale = open_lots(d, notes=notes)
+    warn_rows(notes)
     stale = [lid for lid in stale if d["lots"][lid].get("class") in lim and act.get(lid)]
     for lid in opened:
         lot = d["lots"][lid]
@@ -1119,6 +1530,39 @@ def over(d, project):
     if stale:
         print(f"never closed (started 3+ days ago, no ready time): {', '.join(sorted(stale))} — close them with lot-close or `lots done`")
     return found
+
+
+ROWS_TOLERATED = {"open", "closed", "sweep", "backfill"}
+
+
+def load_checked(client, cmd):
+    ""
+    path = ledger_path(client)
+    try:
+        d = load(client)
+    except (OSError, ValueError, RecursionError) as e:
+        sys.exit(f"lots: the ledger {path} cannot be read ({e.__class__.__name__}: {str(e)[:120]})")
+    if not isinstance(d, dict) or not isinstance(d.get("lots"), dict):
+        sys.exit(f"lots: the ledger {path} is not a lot ledger (a JSON object with a `lots` table of records is expected)")
+    if cmd not in ROWS_TOLERATED:
+        odd = sorted(lid for lid, lot in d["lots"].items() if not isinstance(lot, dict))
+        if odd:
+            sys.exit(f"lots: {cmd}: the ledger {path} holds {len(odd)} row(s) that are no lot record "
+                     f"({', '.join(odd[:NOTE_CAP])}{', …' if len(odd) > NOTE_CAP else ''}): fix them by hand; nothing changed")
+    return d
+
+
+def stamped(cmd, flag, value):
+    ""
+    if not value:
+        return value
+    try:
+        out, added = stamp_zone(value)
+    except (ValueError, OverflowError):
+        sys.exit(f"{cmd}: {flag} {value!r} is not an ISO time (2026-10-24T11:06:00+02:00): nothing written")
+    if added:
+        STAMPED.append(f"{cmd}: {flag} {value} has no time zone: stored as Europe/Paris, {out}")
+    return out
 
 
 READ_ONLY = {"report", "predict", "pooled", "selftest", "cell", "over", "open", "closed"}
@@ -1145,6 +1589,8 @@ def main():
     p.add_argument("--protocol", choices=["A", "B"], help="the protocol arm, from `lots cell --type` (at-risk strata)")
     p.add_argument("--money", action="store_true", help="moves money or rights: fixed at opus · high, not rotated")
     p.add_argument("--ticket", action="store_true")
+    p.add_argument("--dod", action="store_true", help="the brief carries the definition of done the builder answers in "
+                   "the lot's dod.md; verify-lot holds only a stamped lot to it (launch-lot sets it)")
     p.add_argument("--delivery-target", help="ISO time the lot is promised for (launch-lot gives queue-tick's next drop); "
                    "it is kept beside the lot's `ready` stamp, to score the promise")
     p = sub.add_parser("agents"); p.add_argument("id"); p.add_argument("ids")
@@ -1168,7 +1614,9 @@ def main():
     p = sub.add_parser("cell"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
     p.add_argument("--type", help="kind/layer/domain: in an at-risk stratum, the protocol arm is chosen too")
     sub.add_parser("over")
-    sub.add_parser("sweep", help="open lots whose branch is already in its base get their merged time (queue-tick runs it)")
+    sub.add_parser("sweep", help="lots with no merged time get one from a merged PR or their base; a front gives deployed (queue-tick runs it)")
+    p = sub.add_parser("backfill", help="the sweep's proofs on a month's lots, said in each _how; a dry run without --apply")
+    p.add_argument("--month"); p.add_argument("--apply", action="store_true")
     p = sub.add_parser("shelve", help="queue the map write of a closed lot through map-writes (lot-close runs it)")
     p.add_argument("id"); p.add_argument("--worktree", required=True); p.add_argument("--ready", required=True)
     p_open = sub.add_parser("open", help="ids of the open lots, one per line (disk-guard keeps their worktrees)")
@@ -1182,8 +1630,17 @@ def main():
         pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")
         a.project = (json.load(open(pj)).get("claude_project") if os.path.exists(pj) else None) \
             or "~/.claude/projects/" + os.getcwd().replace("/", "-")
-    lock = None if a.cmd in READ_ONLY else ledger_lock(a.client)
-    d = load(a.client)
+    sensors = None
+    if a.cmd == "sweep":
+        sensors = read_sensors(a.client)
+    elif a.cmd == "backfill":
+        a.month = a.month or dt.datetime.now(PARIS).strftime("%Y-%m")
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", a.month):
+            sys.exit(f"backfill: --month {a.month!r} is not YYYY-MM: nothing done")
+        sensors = read_sensors(a.client, since=at_paris(dt.datetime.fromisoformat(a.month + "-01T00:00:00")))
+    dry = a.cmd == "backfill" and not a.apply
+    lock = None if a.cmd in READ_ONLY or dry else ledger_lock(a.client)
+    d = load_checked(a.client, a.cmd)
     fj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/flow.json")
     if os.path.exists(fj):
         PRICES.update(json.load(open(fj)).get("token_prices_per_mtok") or {})
@@ -1193,6 +1650,10 @@ def main():
             sys.exit(f"add: lot {a.id} already exists (« {old.get('title', '')} », started {old.get('started', '?')}"
                      f"{', closed' if is_closed(old) else ''}): nothing changed. A new lot takes a new id; this one "
                      f"changes with `reclass`, `type`, `agents` or `done`")
+        a.started = stamped("add", "--started", a.started)
+        a.delivery_target = stamped("add", "--delivery-target", a.delivery_target)
+        a.since = stamped("add", "--since", a.since)
+        a.until = stamped("add", "--until", a.until)
         cls = a.cls
         meeting = bool(a.type) and parse_type(a.type)["kind"] == "meeting"
         if not cls and not meeting:
@@ -1217,7 +1678,7 @@ def main():
             "title": a.title, "class": cls, "forecast": fc, "kind": "ticket" if a.ticket else None, "human_days": a.human_days, "estimate_source": a.estimate_source,
             "pred_wtok": a.pred_wtok, "pred_agent_h": a.pred_agent_h,
             "model": a.model, "why_model": a.why_model, "effort": a.effort, "money": True if a.money else None,
-            "mapRow": a.map_row, "delivery_target": a.delivery_target,
+            "mapRow": a.map_row, "delivery_target": a.delivery_target, "dod": True if a.dod else None,
             "type": parse_type(a.type) if a.type else None, "protocol": a.protocol,
             "agents": [x for x in a.agents.split(",") if x],
             "started": a.started or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}.items()
@@ -1226,6 +1687,7 @@ def main():
             attach_session(d, a.id, a.session, a.since, a.until)
         save(a.client, d)
     elif a.cmd == "session":
+        a.since, a.until = stamped("session", "--since", a.since), stamped("session", "--until", a.until)
         attach_session(d, a.id, a.session, a.since, a.until)
         save(a.client, d)
     elif a.cmd == "sessions-sync":
@@ -1251,7 +1713,7 @@ def main():
         print(f"sessions-sync: {added} main session(s) added")
     elif a.cmd in ("park", "resume"):
         lot = d["lots"][a.id]
-        at = a.at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        at = stamped(a.cmd, "--at", a.at) or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         ev = {"parked": at, "reason": a.reason} if a.cmd == "park" else {"resumed": at}
         lot.setdefault("parks", []).append(ev)
         save(a.client, d)
@@ -1263,7 +1725,7 @@ def main():
         lot = d["lots"][a.id]
         for k in ("ready", "merged", "deployed"):
             if getattr(a, k):
-                lot[k] = getattr(a, k)
+                lot[k] = stamped("done", f"--{k}", getattr(a, k))
         if a.review_rounds is not None:
             lot["review_rounds"] = a.review_rounds
         if a.worktree:
@@ -1306,10 +1768,24 @@ def main():
     elif a.cmd == "over":
         over(d, a.project)
     elif a.cmd == "sweep":
-        said = sweep(d, a.client)
+        said = sweep(d, a.client, sensors=sensors)
         if said:
             save(a.client, d)
-        print("\n".join(said) or "sweep: no open lot whose branch is already in its base")
+        print("\n".join(said) or "sweep: no open lot whose branch is already in its base, no new merged or deployed proof")
+        for g in sensors["gaps"]:
+            print(f"lots: warning: sweep: {g}", file=sys.stderr)
+    elif a.cmd == "backfill":
+        lines, n = backfill(d, a.client, a.month, sensors)
+        filled = any(k.startswith(("merged: filled", "deployed: filled")) for k in n)
+        if a.apply and filled:
+            save(a.client, d)
+        print("\n".join(lines + [f"{k}: {n[k]}" for k in sorted(n)]) or f"backfill: no lot started in {a.month}")
+        print(f"backfill {a.month}: " + ("applied" if a.apply and filled else "nothing to write" if a.apply
+                                         else "dry run, nothing written"))
+        for g in sensors["gaps"]:
+            print(f"lots: warning: backfill: {g}", file=sys.stderr)
+        if sensors["not_read"] or sensors["gaps"]:
+            sys.exit(f"backfill: not checked in full: {len(sensors['gaps'])} source(s) could not be read")
     elif a.cmd == "shelve":
         if a.id not in d["lots"]:
             sys.exit(f"shelve: no lot {a.id} in the ledger")
@@ -1318,11 +1794,21 @@ def main():
         except (ValueError, RuntimeError) as e:
             sys.exit(f"shelve: the map was not written — {e}")
     elif a.cmd == "open":
-        ids = open_lots(d)[0]
-        names = set(ids) | ({d["lots"][i].get("branch") for i in ids} - {None, ""} if a.branches else set())
+        notes = []
+        ids = open_lots(d, notes=notes)[0]
+        names = set(ids)
+        for i in ids if a.branches else ():
+            b = d["lots"][i].get("branch") if isinstance(d["lots"][i], dict) else None
+            if b and isinstance(b, str):
+                names.add(b)
         print("\n".join(sorted(names)))
+        sys.stdout.flush()
+        warn_rows(notes)
     elif a.cmd == "closed":
-        print("\n".join(sorted(lid for lid, lot in d["lots"].items() if is_closed(lot))))
+        notes = []
+        print("\n".join(sorted(lid for lid, lot in d["lots"].items() if is_closed(lot, notes, lid))))
+        sys.stdout.flush()
+        warn_rows(notes)
     elif a.cmd == "type":
         d["lots"][a.id]["type"] = parse_type(a.value)
         save(a.client, d)

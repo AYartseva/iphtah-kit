@@ -1,7 +1,14 @@
 LOT: $lot
 $title  (class $cls, type $type)
 $money
-## Goal
+## Purpose
+<the session writes it in $purpose before the first agent starts, as to a colleague it trusts: what this is for and who it
+helps, what it protects against (an accident or an adversary), what it must NEVER block. Paste it here; fix and re-review
+briefs read that file.>
+
+How you get there is yours: you see the code and I do not. Say what you think, and say when this brief is wrong.
+
+## What I can tell you that the code cannot
 <the session writes the context the code can't tell, one line each (QQOQCCP), and leaves out a line the code tells:
 - Qui: who asked, who uses the result, who decides
 - Quoi: what this lot delivers
@@ -9,14 +16,13 @@ $money
 - Quand: when it is used, and by when it is needed
 - Comment: only where the code can't tell it; more steps for a smaller model
 - Combien: its size, its budget, the scale it must hold
-- Pourquoi: the Purpose below>
+- Pourquoi: the Purpose above>
 $map
-## Purpose
-<the session writes it in $purpose before the first agent starts: what this is for, what it protects against (an
-accident or an adversary), what it must NEVER block. Paste it here; fix and re-review briefs read that file.>
 
 ## Definition of done: what it must not do (fixed; answer each line with a test, or « n/a: why »)
-<the builder writes, before the first commit, one line per item: the bad case for this lot and what must happen>
+<the builder writes, before the first commit, in $dod, one numbered line per item (« 1. », « 2. »…, the
+client's lines numbered on from 13): the bad case for this lot and what must happen. verify-lot reads that file and
+refuses the lot while a line is missing or an « n/a » has no reason after it>
 1. Coexistence: an interruption, network latency, a second click, a retry, two runs in parallel → no corrupted state,
    no panic, no double effect, no lost write.
 2. Proof: each guard has a test that is red when the guard is cut; no test that cannot fail.
@@ -35,8 +41,9 @@ accident or an adversary), what it must NEVER block. Paste it here; fix and re-r
 11. Zero waste: the run ends with a clean exit code, its temporary files removed and no orphan process or container
    left behind. If /tmp grew by 1 MB or a container lingers, the status is FAILED.
 12. A surgical diff: no duplicated file (_v2, _new, _old, copy), no change outside the strict scope of the issue.
-Plus the client's own lines: project.json `review_catches`.
-A lot with no code (a demo, a count, a test on the platform, research) answers 3, 7, 8, 9 and 11 only.
+Plus the client's own lines: project.json `review_catches`, numbered 13, 14… in their order.
+A lot with no code (a demo, a count, a test on the platform, research: the ledger's type, or a branch that changes
+no file) answers 3, 7, 8, 9 and 11 only.
 
 ## Evidence
 <the session writes: file:line, issue links, outputs that show the need>

@@ -3,6 +3,8 @@
 """
 import argparse
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -10,6 +12,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import _purpose as P
 STRAYS = re.compile(r"^(docs/PLAN_|memory/)")
 UI_FILE = re.compile(r"\.(tsx|jsx|css|scss|html|vue|svelte)$")
 MIGRATION = re.compile(r"(db/[\w-]*migrations?/(?:[^/]+/)?V\d+__[^/]+\.sql|migrations/\d{4}_[^/]+\.sql)$")
@@ -170,6 +174,129 @@ def ui_proof(wt, ui_files, proof_dir=None, waived=None, head=None):
     return False, f"STALE: {worst[0]} {why} — rerun it on the final code and look at the screenshots"
 
 
+DOD_FILE = "dod.md"
+DOD_LINES = 12
+DOD_NO_CODE = (3, 7, 8, 9, 11)
+DOD_FORM = "each item on its own line: « N. a test, or what runs », or « N. n/a: why »"
+DOD_ITEM = re.compile(r"^\s*(?:[-*#]+\s*)?\**(\d{1,3})\**\s*[.):]\s*(.*)$")
+DOD_NA = re.compile(r"^\s*(?:n\s*[./]?\s*a\.?|not applicable|non applicable|sans objet)\b[\s:.,;()—–-]*(.*)$", re.I | re.S)
+WORD = re.compile(r"[^\W\d_]{2,}")
+DUPLICATE = re.compile(r"(?i)(?:_v\d+|_new|_old|[ _-]copy(?: ?\d+)?)(?=(?:\.[^./]*)*$)")
+
+
+def dod_answers(text):
+    ""
+    out, current = {}, None
+    for line in text.splitlines():
+        m = DOD_ITEM.match(line)
+        if m:
+            current = int(m.group(1))
+            out[current] = [m.group(2)]
+        elif current is not None and line.strip():
+            out[current].append(line.strip())
+    return {n: " ".join(parts).strip() for n, parts in out.items()}
+
+
+def dod_check(text, required):
+    ""
+    answers = dod_answers(text)
+    bad = []
+    for n in required:
+        a = answers.get(n, "")
+        na = DOD_NA.match(a)
+        if na is not None:
+            if not WORD.search(na.group(1)):
+                bad.append(f"line {n}: n/a without a reason")
+        elif not WORD.search(a):
+            bad.append(f"line {n}: missing")
+    return not bad, ("answered" if not bad else "; ".join(bad))
+
+
+def dod_required(no_code, catches):
+    ""
+    return list(DOD_NO_CODE) if no_code else list(range(1, DOD_LINES + 1 + len(catches or ())))
+
+
+def no_code(row, changed):
+    ""
+    kind = (row or {}).get("type") if isinstance(row, dict) else None
+    if isinstance(kind, dict) and kind.get("kind") == "research":
+        return True, "ledger type research"
+    if not changed:
+        return True, "no file changed against the base"
+    return False, None
+
+
+def launched_before_check(row):
+    ""
+    return isinstance(row, dict) and row.get("dod") is not True
+
+
+def dod_roots():
+    ""
+    roots = [P.stable_root()]
+    own = os.environ.get("CLAUDE_SCRATCHPAD")
+    if own and os.path.realpath(own) != os.path.realpath(roots[0]):
+        roots.append(own)
+    return roots
+
+
+def dod_line(lot, row, changed, catches, roots=None, why_no_row="no ledger row for the lot"):
+    ""
+    if not lot:
+        return True, f"not checked (no --lot: the answers live in <scratch>/<lot>/{DOD_FILE})"
+    if launched_before_check(row):
+        return True, "not checked (launched before the check)"
+    if not P.valid_lot(lot):
+        return False, f"MISSING: « {lot} » is not a plain lot name, so its {DOD_FILE} has no folder"
+    nc, why = no_code(row, changed)
+    required = dod_required(nc, catches)
+    scope = f"{len(required)} line(s)" + (f", no code: {why}" if nc else "")
+    paths = [os.path.join(r, lot, DOD_FILE) for r in (roots or dod_roots())]
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return False, f"UNREADABLE: {p} ({e.strerror})"
+        ok, what = dod_check(text, required)
+        return ok, (f"answered (presence only, {scope}) in {p}" if ok
+                    else f"NOT ANSWERED: {what} ({scope}) in {p}; {DOD_FORM}")
+    row_note = "" if row is not None else f"; {why_no_row}, so it counts as launched after the check"
+    return False, f"MISSING: no {DOD_FILE} at {' or '.join(paths)} ({scope}{row_note}); {DOD_FORM}"
+
+
+def duplicates(added, existing):
+    ""
+    existing = set(existing)
+    out = []
+    for f in added:
+        d, name = os.path.split(f)
+        sibling = DUPLICATE.sub("", name, count=1)
+        if sibling != name and os.path.join(d, sibling) in existing:
+            out.append(f)
+    return out
+
+
+def _lots():
+    loader = importlib.machinery.SourceFileLoader("lots_for_verify", os.path.join(HERE, "lots"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def ledger_row(client, lot):
+    ""
+    try:
+        d = _lots().load(client)
+        row = (d.get("lots") or {}).get(lot) if isinstance(d, dict) else None
+    except Exception as e:
+        return None, "ledger unreadable: " + (str(e).strip().splitlines() or ["?"])[-1][:200]
+    return (row, None) if isinstance(row, dict) else (None, "no ledger row for the lot")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("worktree")
@@ -198,7 +325,12 @@ def main():
         wt, sh(["docker", "ps", "--format", "{{.Names}}"]).splitlines(), build_processes())
     ui_ok, ui_line = ui_proof(wt, [f for f in changed if UI_FILE.search(f) and "/test" not in f
                                    and ".test." not in f and ".spec." not in f], a.proof, a.no_ui_proof, head)
-    ok = not tracked and greens and not strays and not containers and ui_ok
+    copies = duplicates(sh(["git", "diff", "--name-only", "--diff-filter=AR", f"origin/{base}...HEAD"], cwd=wt).splitlines(),
+                        sh(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt).splitlines()
+                        + sh(["git", "ls-tree", "-r", "--name-only", f"origin/{base}"], cwd=wt).splitlines())
+    row, why_no_row = ledger_row(c, a.lot) if a.lot else (None, None)
+    dod_ok, dod_text = dod_line(a.lot, row, changed, cfg.get("review_catches"), why_no_row=why_no_row or "")
+    ok = not tracked and greens and not strays and not containers and ui_ok and not copies and dod_ok
     print(f"{c} / {repo_name} — {branch} @ {head[:8]}  {subject}")
     print(f"  tree:        {'clean' if not tracked else f'{len(tracked)} uncommitted change(s)'}"
           f"{f' ({len(untracked)} untracked)' if untracked else ''}")
@@ -208,6 +340,11 @@ def main():
     print(f"  containers:  {', '.join(containers) if containers else 'none left'}"
           f"{f' (other builds containers, ignored: {len(other_containers)})' if other_containers else ''}")
     print(f"  phone proof: {ui_line}")
+    print(f"  copies:      {', '.join(copies) if copies else 'none'}"
+          f"{' (a file named _v2 / _new / _old / copy beside its original: a duplicate)' if copies else ''}")
+    print(f"  definition of done: {dod_text}")
+    print("  zero waste /tmp: not checked (shared /tmp)")
+    print("  scope of the diff: not checked (the diff is not compared with the scout's goesWhere)")
     for tool, label in (("migration-lint", "sql lint:"), ("save-check", "save check:"),
                         ("two-sources-lint", "two sources:")):
         try:

@@ -17,7 +17,7 @@ MECH_FILE = re.compile(
     r"|npm-shrinkwrap\.json|composer\.lock|Cargo\.lock|go\.sum)$"
     r"|(^|/)requirements/.*\.txt$"
     r"|(^|/)(locale|locales|translations|i18n)/"
-    r"|\.(po|pot|mo)$"
+    r"|\.(po|pot|m[o])$"
     r"|(^|/)(vendor|vendored|third|third_party|thirdparty|node_modules|bower_components)/"
     r"|\.min\.(js|css)$|\.map$"
     r"|(^|/)(generated|dist)/"

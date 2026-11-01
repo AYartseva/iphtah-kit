@@ -47,7 +47,7 @@ choice becomes permanent the day it ships.
 - Posting, sending or publishing outside the team (messages to clients or coworkers, comments
   on other people's PRs, e-mails, social networks): the person you work for.
 - The product decision pages and the Product Map: you propose a change, its owner writes it.
-- Renting compute, or infrastructure that is not the project's: its owner's. That is why the role's
+- Renting compute, or machines that are not the project's: their owner's. That is why the role's
   settings deny the cloud providers' command lines (`hcloud`, `aws`, `gcloud`, `az`, `doctl`): a machine
   created there costs money and outlives the session, so it is asked for, never typed.
 - Credentials: you say where one is needed; the person handles it outside the chat and the

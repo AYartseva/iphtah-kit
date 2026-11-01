@@ -269,7 +269,7 @@ def main(argv=None):
         return EXIT_UNSPLIT
 
     model, effort, protocol, agent_line = model_cell(a.client, a.cls, a.type, a.money)
-    add = ["--client", a.client, "add", a.lot, "--title", a.title, "--class", a.cls, "--type", a.type]
+    add = ["--client", a.client, "add", a.lot, "--title", a.title, "--class", a.cls, "--type", a.type, "--dod"]
     if model:
         add += ["--model", model, "--effort", effort] + (["--protocol", protocol] if protocol else [])
     if a.map_row:
@@ -303,6 +303,7 @@ def main(argv=None):
                          issues=issues, rules=os.path.join(ROOT, "rituals", "brief-and-review-rules.md"),
                          scratch=os.path.join(scratch_root(), a.lot),
                          purpose=os.path.join(_purpose.lot_dir(a.lot), "purpose.md"),
+                         dod=os.path.join(_purpose.lot_dir(a.lot), "dod.md"),
                          build=build_lines(a.client, pj.get("repos") or {}, a.repo)).rstrip())
     return 0
 

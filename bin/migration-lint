@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 FLYWAY = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$")
 REPEATABLE = re.compile(r"^R__.+\.sql$")
 NUMBERED = re.compile(r"^(\d+)_.+\.sql$")
-ERRORS = {"M1", "M5", "M6", "M7"}
+ERRORS = {"M1", "M5", "M6", "M7", "M9"}
 ALLOW = re.compile(r"--\s*lint:\s*allow\s+((?:M\d+\s*,?\s*)+)(.*)$", re.I)
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 PR_ADDS = {"added", "renamed", "copied"}
@@ -363,6 +363,105 @@ def allowed(lines, line, rule):
     return None
 
 
+M9_NAME = r'(?:"[^"]*"|[\w$]+)(?:\s*\.\s*(?:"[^"]*"|[\w$]+))*'
+M9_ROLLBACK = re.compile(r"^U\d+(?:[._]\d+)*__.+\.sql$|.+\.down\.sql$")
+M9_REASON = re.compile(r"[^\W\d_]{2,}")
+M9_COMMENT_LINE = re.compile(r"^[ \t]*--.*$", re.M)
+M9_EVENT = re.compile(rf"""(?P<quote>')|(?P<semi>;)
+    |\bcreate\s+(?:unlogged\s+)?table\s+(?P<new_if>if\s+not\s+exists\s+)?(?P<new>{M9_NAME})
+    |\balter\s+(?:foreign\s+)?table\s+(?:if\s+exists\s+)?(?:only\s+)?(?P<table>{M9_NAME})
+    |\badd\s+column\s+(?P<col_if>if\s+not\s+exists\s+)?(?P<col>{M9_NAME})
+    |\badd\s+constraint\s+(?P<con>{M9_NAME})
+    |(?P<drop>\bdrop\b(?!\s+(?:not\s+null|default)\b|\s+index\s+(?!cascade\b|restrict\b)[^\s;,]))
+    |(?P<rename>\brename\b)|(?P<schema>\bset\s+schema\b)|(?P<truncate>\btruncate\b)
+    |(?P<type>\balter\b(?=\s+(?!(?:foreign\s+)?table\b|type\b))(?=[^;,]*?\btype\s+(?!set\b|drop\b))
+              |\balter\b(?=\s+type\s+(?:set\s+data\s+)?type\b)
+              |"\s+type\s+(?!set\b|drop\b))""", re.I | re.X)
+M9_DROP_TABLE = re.compile(rf"drop\s+table\s+(?:if\s+exists\s+)?({M9_NAME}(?:\s*,\s*{M9_NAME})*)", re.I)
+M9_DROP_PART = re.compile(rf"drop\s+(constraint\s+|column\s+)?(?:if\s+exists\s+)?({M9_NAME})", re.I)
+M9_RENAME_TABLE = re.compile(rf"rename\s+to\s+({M9_NAME})", re.I)
+M9_TYPE_OF = re.compile(rf"alter\s+(?:column\s+)?({M9_NAME})\s+(?:set\s+data\s+)?type\b", re.I)
+
+
+def m9_name(text):
+    ""
+    n = ".".join(p[1:-1] if p.startswith('"') else p.lower() for p in re.findall(r'"[^"]*"|[^.\s]+', text))
+    return n[len("public."):] if n.startswith("public.") else n
+
+
+def m9_allowed(sql, line):
+    ""
+    lines = sql.split("\n")
+    for ln in (line, line - 1):
+        m = ALLOW.search(lines[ln - 1]) if 1 <= ln <= len(lines) else None
+        if (m and "M9" in re.findall(r"M\d+", m.group(1).upper()) and M9_REASON.search(m.group(2))
+                and (ln == line or lines[ln - 1].lstrip().startswith("--"))):
+            return m.group(2).strip()
+    return None
+
+
+def lint_m9(path, sql, born):
+    ""
+    text = M9_COMMENT_LINE.sub(lambda m: " " * len(m.group(0)), sql)
+    sure = not re.search(r"/\*|\$|--", text)
+    found, table, quotes, line, at = {}, None, 0, 1, 0
+
+    def harmless(m, kind):
+        is_new = (table,) in born
+        if kind == "drop":
+            t = M9_DROP_TABLE.match(text, m.start())
+            if t:
+                names = {m9_name(n) for n in re.split(r"\s*,\s*", t.group(1))}
+                gone = all((n,) in born for n in names)
+                if gone:
+                    born.difference_update({k for k in born if k[0] in names})
+                return gone
+            part = M9_DROP_PART.match(text, m.start())
+            if not part:
+                return False
+            con = (part.group(1) or "").lower().startswith("constraint")
+            key = (table, "con" if con else "col", m9_name(part.group(2)))
+            ok = is_new or key in born
+            born.discard(key)
+            return ok
+        if kind == "rename":
+            new = M9_RENAME_TABLE.match(text, m.start())
+            if is_new and new:
+                born.add((m9_name(new.group(1)),))
+            return is_new
+        if kind == "type":
+            of = M9_TYPE_OF.match(text, m.start())
+            return is_new or bool(of and (table, "col", m9_name(of.group(1))) in born)
+        return False
+
+    for m in M9_EVENT.finditer(text):
+        kind = m.lastgroup
+        if kind == "quote":
+            quotes += 1
+        elif kind == "semi":
+            table = None
+        elif kind in ("new", "table", "col", "con"):
+            if not sure or quotes % 2:
+                continue
+            name = m9_name(m.group(kind))
+            if kind == "table":
+                table = name
+            elif kind == "new" and not m.group("new_if"):
+                born.add((name,))
+            elif kind == "col" and table and not m.group("col_if"):
+                born.add((table, "col", name))
+            elif kind == "con" and table:
+                born.add((table, "con", name))
+        elif not harmless(m, kind):
+            line += text.count("\n", at, m.start())
+            at = m.start()
+            what = " ".join(re.split(r"[;\n]", text[at:at + 80])[0].split())
+            found.setdefault(line, ("M9", path, line, f"`{what}`: not add-only, so a deploy cannot roll back across it "
+                                    "(a destructive word in text goes red too). Make it add-only, or accept « no "
+                                    "automatic rollback » with `-- lint: allow M9 <reason>`"))
+    return list(found.values())
+
+
 def next_free(*versions):
     ""
     top = max(v for v in versions if v is not None)
@@ -420,6 +519,13 @@ def run(repo, base, head="HEAD", prs=None, own_branch=None):
                              f"applied migration {what}: add a new migration instead"))
         if st != "D" and kind(new):
             findings += lint_text(new, contents[new], new_tables)
+
+    borns = {}
+    for st, _, new in sorted((c for c in changes if c[0] != "D" and kind(c[2])
+                              and (FLYWAY.match(os.path.basename(c[2])) or not M9_ROLLBACK.match(os.path.basename(c[2])))),
+                             key=lambda c: (kind(c[2]) == "repeatable", version(c[2]) or (), c[2])):
+        born = borns.setdefault(os.path.dirname(new), set())
+        findings += lint_m9(new, contents[new], born if st in "AC" else set(born))
 
     by_dir = {}
     for p in added:
@@ -493,7 +599,8 @@ def run(repo, base, head="HEAD", prs=None, own_branch=None):
         rule, path, line, reason = f[:4]
         severity = f[4] if len(f) > 4 else ("error" if rule in ERRORS else "warn")
         lines = contents.get(path, "").splitlines()
-        out.append((rule, path, line, reason, allowed(lines, line, rule), severity))
+        ok = m9_allowed(contents.get(path, ""), line) if rule == "M9" else allowed(lines, line, rule)
+        out.append((rule, path, line, reason, ok, severity))
     out.sort(key=lambda f: (f[1], f[2], f[0]))
     return out, sorted({c[2] for c in changes if c[0] != "D"} | {c[1] for c in changes if c[0] == "D"}), problems, notes
 

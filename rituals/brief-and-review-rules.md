@@ -124,6 +124,18 @@ are, and when it overrules a challenge it says why in its report to the person.
     A temporary folder or file comes from `tempfile.TemporaryDirectory()`,
     or `self.addCleanup(shutil.rmtree, d, True)`; a helper with no `self` registers its own cleanup, a fixture made once per class `cls.addClassCleanup(...)`, once per module `unittest.addModuleCleanup(...)`.
 
+19. **Seams before the mud: core, shared base, the rest** (27/10/2026). A client's
+    product is read in three layers, named from the code, not the docs: the client's **core** (what only they sell),
+    the **shared base** (identity, tenancy, rights, jobs, storage) and **the rest**, each part of which is a candidate to
+    bud (leave the platform and sell alone) or to integrate where the client already works. Imports go one way only:
+    rest → core → base.
+    - The first lot on a product adds a layer test to the client's build, with today's wrong-way imports frozen as a
+      baseline: nothing breaks today, every new wrong-way import fails, the list only shrinks.
+    - Each brief names the layer its lot builds in; a lot in the shared base (a job runner, a scheduler) registers
+      handlers and never imports the core.
+    - Why: budding and integration stay cheap only if the seams exist before the code grows; once the mud sets, a bud
+      costs a rewrite. It is « the integration of the newcoming reality », not over-quality.
+
 ## Severity: how much proof, and when review stops (15/10/2026)
 
 The launch declares a severity; the review reads the **actual** one from what the diff touches, and the higher wins.
@@ -148,6 +160,13 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   VM runs at 64 MiB / a few processes / a few MB at most, inside its own capped scope and under a timeout. Real-size
   load goes to a rented build machine. (24/10/2026: a review probe of the memory cap, 2 GiB under a throttle, stalled the VM for two
   minutes and set off the dead man's switch.)
+- **A test stops only what it started:** a cleanup on the shared VM stops units, scopes or processes by the exact names or
+  pids it created (or through its own slice), never by a pattern such as `iphtah-cap-*`. (26/10/2026: a draft cleanup
+  stopped every capped build on the VM, two real builds cut off mid-run.)
+- **An arbitrary number is a parameter:** a cap, a threshold, a wait or a margin that a lot chooses is read from its
+  settings file (the machine file, the client's project file), and the session writes it as a decision with its KPI and
+  a check date a week later; the code holds only a fallback naming that decision. If the number fits, nothing more is
+  done; if it causes problems, it is rethought from the data. (26/10/2026.)
 - **The definition of done first:** the lot brief's fixed block (templates/lot-brief.txt, twelve « must not » lines plus
   the client's `review_catches`) is answered line by line in the report, each with a test or « n/a: why ». Check that
   each answer is true; an unanswered or wrongly « n/a » line is a finding.
@@ -156,7 +175,7 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   recipe. If the worst is acceptable, say go; if not, it is a one-way door for its owner. Reviewers only: builders
   build boldly, and imagining the worst makes them cautious.
 - **Concurrency:** a read-then-save-whole? Can a button be pressed twice? Does a dialog return its promise?
-- **Errors:** does each remote call handle each status? Is any error cached as « empty »? Can one poison item
+- **Errors:** when this fails, what does it say happened (money, alarms, rights above all: a failure reported as success)? Does each remote call handle each status? Is any error cached as « empty »? Can one poison item
   stop the queue?
 - **States:** does the screen ever say something false when a load fails, or before it ends?
 - **Proof:** which guard has no negative control? Which mutant would survive? (`bin/mutant-check`'s survivors
@@ -196,6 +215,11 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   - Enforced by `bin/migration-lint` (05/10/2026): M2, M4, M3 as warnings; an applied migration modified
     (M5) and a duplicate or too-low number (M6) as errors that turn merge-check red. A finding is accepted
     with `-- lint: allow M<n> <reason>` on its line or the line before.
+  - Add-only, or written down: a DROP (not of an index), a RENAME, SET SCHEMA, a column TYPE change or TRUNCATE (M9, an
+    error, 01/11/2026) stops the merge, unless the branch itself surely created the table, column or constraint earlier.
+    It reads plain patterns, not SQL: a destructive word in text goes red, by design. Automatic rollback is only safe
+    across add-only migrations, so an allowed M9 means « no automatic rollback »: say so in the reason.
+    Green is not proof of add-only: its header names what it does not read (DELETE, SET NOT NULL…).
 - **Ownership (07/10/2026):** whose is what this touches (data, content, a key, a name, a licence, a message sent
   in someone's name), and who answers if it harms someone? Being able to do it is not the question: is it ours
   to do, under the agreement, the purpose a key was given for, the licence, the person's consent? Responsibility
