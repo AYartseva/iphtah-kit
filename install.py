@@ -434,7 +434,7 @@ def show_install(p, home):
     for path, text in p["egress"].items():
         if read(path) != text:
             changes += 1
-            print(f"{'+' if read(path) is None else '~'} {path} (a user timer, every 5 minutes: what this account's processes talk to, kept on this machine only)")
+            print(f"{'+' if read(path) is None else '~'} {path} (a user timer, every 5 minutes: what this account's processes talk to, kept on this machine only, in {os.path.join(home, KIT_STATE, 'egress.jsonl')}; started with systemctl --user enable --now iphtah-kit-egress.timer)")
     if p["client"] is None:
         if p["existing"]:
             print(f"= client file kept: {', '.join(p['existing'])} (yours)")
@@ -447,8 +447,8 @@ def show_install(p, home):
 
 def egress_units(home, src):
     """{path: text} of the timer's units, or {} when this kit copy has no egress tool."""
-    if not os.path.isfile(os.path.join(src, "bin", "egress")):
-        return {}
+    if not os.path.isfile(os.path.join(src, "bin", "egress")) or not shutil.which("systemctl"):
+        return {}   # a Mac or a container: no timer that could never run; `egress sample` still runs by hand
     return {os.path.join(home, ".config/systemd/user", name): text.format(kit=KIT) for name, text in EGRESS_UNITS.items()}
 
 
@@ -470,7 +470,8 @@ def enable_egress_timer(home):
         print("egress timer on: `egress profile` shows what this account talks to. It runs while you are logged in, "
               "unless you run: loginctl enable-linger")
     else:
-        print("! egress timer not started (no user systemd here?): the units are written; `egress sample` also runs by hand.")
+        print("! egress timer not started (no user session here?). The units are written; run: "
+              "systemctl --user enable --now iphtah-kit-egress.timer")
 
 
 def backup(home, p, role):
@@ -637,7 +638,7 @@ def do_uninstall(a, home):
     for t in theirs:
         print(f"= {t} (yours, left where it is)")
     if os.path.isdir(os.path.join(home, KIT_STATE)):
-        print(f"= {os.path.join(home, KIT_STATE)} (the kit's records, left where they are)")
+        print(f"= {os.path.join(home, KIT_STATE)} (the kit's records, left where they are: the build results and egress.jsonl, egress.jsonl.1, the reverse-name cache; delete the folder if you want nothing left)")
     if not plan:
         print("Nothing of the kit found.")
         return 0

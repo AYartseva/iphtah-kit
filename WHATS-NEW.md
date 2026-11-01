@@ -2,6 +2,11 @@
 
 One line per kit file an update changed, newest first; what the person may do with it, if they wish: `feedback.md`.
 
+## Since method e8879958 (2026-11-01T17:53:45+00:00, with local changes), now method 2438adba (2026-11-01T18:13:33+00:00)
+
+- README.md (changed, +1 −1 lines): in « First steps, with your Claude »; new text: « The installer also sets up a user timer, `egress sample` every 5 minutes: what this account's proce… »
+- install.py (changed, +6 −5 lines): in « show_install », « egress_units », « enable_egress_timer », « do_uninstall »
+
 ## Since method e8879958 (2026-11-01T17:53:45+00:00, with local changes), now method e8879958 (2026-11-01T17:53:45+00:00, with local changes)
 
 - install.py (changed, +2 −1 lines): in « systemctl_user »
