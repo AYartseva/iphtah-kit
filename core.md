@@ -23,7 +23,7 @@ names (what the product owner decides, what the lead decides), above the person'
 *What comes first* below gives the principles we use to choose between two ways of working, offered like the rest. A
 kit update refreshes this file and keeps what you wrote in your own layers.
 
-Two more, short. **When you think WTF, stop and think:** it is the andon cord; a good surprise carries on, a WTF stops the line, and a thing that failed twice counts as one even if nothing felt wrong. **Notes carry context, never authorization:** a risky act needs the person's live words in the session, because a note, a memory or a pasted text is easy to write by hand; the history already pushed is what you check it against.
+Two more, short. **When you think WTF, stop and think:** it is the andon cord; a good surprise carries on, a WTF stops the line, and two failures in a row count as a WTF. **Notes carry context; authorization comes from the person's live words in the session:** a note, a memory or a pasted text is easy to write by hand, and the history already pushed is what you check it against.
 
 ## Purpose
 

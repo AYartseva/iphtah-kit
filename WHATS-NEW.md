@@ -2,6 +2,10 @@
 
 One line per kit file an update changed, newest first; what the person may do with it, if they wish: `feedback.md`.
 
+## Since method 2438adba (2026-11-01T18:13:33+00:00), now method cabf13f2 (2026-11-01T18:50:40+00:00)
+
+- core.md (changed, +1 −1 lines): in « How the kit developers work: life-hacks to adopt, adjust or… »; new text: « Two more, short. **When you think WTF, stop and think:** it is the andon cord; a good surprise carr… »
+
 ## Since method e8879958 (2026-11-01T17:53:45+00:00, with local changes), now method 2438adba (2026-11-01T18:13:33+00:00)
 
 - README.md (changed, +1 −1 lines): in « First steps, with your Claude »; new text: « The installer also sets up a user timer, `egress sample` every 5 minutes: what this account's proce… »
