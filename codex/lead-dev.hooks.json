@@ -1,0 +1,88 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event PreToolUse --matcher Bash --if 'Bash(*git*push*)' --timeout 20 -- '~/.claude/iphtah-kit/bin/push-gate'",
+            "timeout": 20,
+            "statusMessage": "push-gate: checking the pushed commit against its definition of done (done.json)"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event PreToolUse --matcher Bash --if 'Bash(*gh *)' --timeout 10 -- '~/.claude/iphtah-kit/bin/heavy-gate'",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: posted text is not rewritten by the shell"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event PreToolUse --matcher Bash --if 'Bash(*pkill*)' --timeout 10 -- '~/.claude/iphtah-kit/bin/heavy-gate'",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: kill by PID"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event PreToolUse --matcher Bash --if 'Bash(*pgrep*)' --timeout 10 -- '~/.claude/iphtah-kit/bin/heavy-gate'",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: kill by PID"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event PreToolUse --matcher Bash --timeout 5 -- 'python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py deny --rules ~/.claude/iphtah-kit/codex-deny.json'",
+            "timeout": 5,
+            "statusMessage": "role rules: what the role may not run"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event UserPromptSubmit --timeout 5 -- '~/.claude/iphtah-kit/bin/prompt-lines --auto 2>/dev/null || true'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event SessionStart --timeout 5 -- '~/.claude/iphtah-kit/bin/prompt-lines --auto --session-start 2>/dev/null || true'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/iphtah-kit/bin/_codex_hooks.py run --event Stop -- '~/.claude/iphtah-kit/bin/loops stop-check 2>/dev/null || true'"
+          }
+        ]
+      }
+    ]
+  },
+  "notes": [
+    "PreToolUse 'Monitor': Codex has no such tool (Monitor): NOT mapped",
+    "PreToolUse 'Monitor': Codex has no such tool (Monitor): NOT mapped",
+    "permissions.deny: ArtifactData name Claude tools Codex lacks: NOT carried over (the 4 shell rules are enforced by the role deny gate)"
+  ]
+}

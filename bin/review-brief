@@ -135,8 +135,9 @@ def main():
             out.append("\n**Review questions (every one; answer with file:line evidence, or « nothing found »):**\n"
                        + questions)
         if catches and severity != "low":
-            out.append("\n**What this client's human reviewers have caught before (look for each):**\n"
-                       + "\n".join(f"- {c}" for c in catches))
+            out.append("\n**What this client's human reviewers have caught before (look for each; the number is the "
+                       "builder's dod.md line that answers it):**\n"
+                       + "\n".join(P.numbered_catches(catches)))
     else:
         if purpose is not None:
             out.append(f"\n**Purpose** (judge each fix against it: does it still stop what it must, and still allow what it must never block?):\n\n{purpose}")
@@ -149,7 +150,8 @@ def main():
     out.append(f"\n**Report** (under {words} words): findings ranked blocking / should fix / nit, each with file:line "
                "and a concrete scenario. Say plainly « nothing blocking », or « clean » when nothing needs fixing "
                "before push. End the report with one line of its own: « Verdict: clean » when nothing needs fixing "
-               "before push, else « Verdict: findings ».")
+               "before push, else « Verdict: findings ». Put the evidence of "
+               "what you checked under a line of its own, « Checked », and leave out a rank with nothing in it.")
     out.append("\n(For the session: paste this whole text as the reviewer's prompt.)")
     print("\n".join(out))
 

@@ -93,6 +93,11 @@ are, and when it overrules a challenge it says why in its report to the person.
       no hand-written mutant script, which is how a builder lost uncommitted work that day); it prints, per
       mutant, KILLED by which test / SURVIVED / NO COVERAGE. Run it before the review and paste its summary line
       in the PR body; a survivor is a guard without proof.
+    - « NOT RUN: <reason> » (exit 3, 05/11/2026) means nothing was proved: no test covers the
+      lines, the tests were red before any mutation, no mutant got a verdict, the runner crashed, timed out or had no
+      room. verify-lot refuses it until a later run runs, or until the session writes a waiver in the ledger (`lots
+      waive <lot> --mutant "<why>"`, the hand-made cuts named in the why); the builder reports it and never waives its
+      own proof, and ship-lot, ship-own and lot-close show « mutant-check waived: <why> » where a person reads it.
 12. **A screen works on a phone** (06/10/2026, when the client asks for it): render every new or changed screen,
    mockups included, at 360, 390 and 768 px, and look at the screenshots. No sideways
    scroll; touch targets of 44 px; a menu that folds instead of filling the first screen; a detail that opens next to
@@ -131,10 +136,23 @@ are, and when it overrules a challenge it says why in its report to the person.
     rest → core → base.
     - The first lot on a product adds a layer test to the client's build, with today's wrong-way imports frozen as a
       baseline: nothing breaks today, every new wrong-way import fails, the list only shrinks.
+    - **Components talk through APIs only** (07/11/2026): another component's tables, files, caches or internal state are never read or written
+      directly; the call goes through its published API or contract. The layer test enforces it inside one codebase;
+      between codebases, services and our own tools, the review asks it.
     - Each brief names the layer its lot builds in; a lot in the shared base (a job runner, a scheduler) registers
       handlers and never imports the core.
     - Why: budding and integration stay cheap only if the seams exist before the code grows; once the mud sets, a bud
       costs a rewrite. It is « the integration of the newcoming reality », not over-quality.
+
+20. **A guard that reads free text is loosened by failing closed, never by a wider grammar** (05/11/2026: two lots
+    the same night, a gate on shell commands and a counter of review findings, each widened its reading to stop a
+    false refusal and each let a real case through; both caught in review). Pass exactly the sighted false refusals; wherever
+    the new reading is unsure (a character it doesn't model, an exception, a form it doesn't parse), keep the old answer or
+    refuse. When the false refusals come from how a text is written, fix the writer's format (a fixed title, one
+    command per call) before the reader. Prove it with the cases the old reading refused, still refused.
+    A tightening leaves the old reading untouched: the old reading decides first, and each new check can only add a
+    refusal; a test runs both and asserts the new refuses everything the old refused (06/11/2026: two tightenings
+    that changed the old reading each let through a case it had refused).
 
 ## Severity: how much proof, and when review stops (15/10/2026)
 
@@ -148,6 +166,11 @@ client adds paths with project.json `severity_high_paths`) and cuts the brief to
 | **High** | the diff touches money movements, the rights grid, auth or security config, personal-data deletion, a migration | every guard mutant-proven, with negative controls; the money-rights builder at high effort | when no finding is above minor, or after 3 rounds: then a person decides |
 | **Normal** | product behaviour; a gate (push-gate, keep-gate, wa, anything that blocks or sends) | a test per changed behaviour | after one review and the fix of real bugs; edge cases become an issue, not a round |
 | **Low** | docs, wording, reports and listings | the build passes | one pass |
+
+**A new gate lands warning first**: a new check that would refuse a build, a
+push or a message ships in a mode that only warns, and becomes a refusal per client (its project file) once a week of
+its own findings shows few false refusals. Its tests prove the code; only the field proves the rule, and a false
+refusal costs someone else's merge. So review rounds on a new gate stop at the fix of real bugs, as for any normal lot.
 
 A finding that is a rule question (« this guard can be walked around: is that intended? ») is not a build round: it
 goes to the decider of that rule as a question. Each round is counted by its cause: a **defect** (our bug), a
@@ -167,9 +190,18 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   settings file (the machine file, the client's project file), and the session writes it as a decision with its KPI and
   a check date a week later; the code holds only a fallback naming that decision. If the number fits, nothing more is
   done; if it causes problems, it is rethought from the data. (26/10/2026.)
+  - Enforced by `bin/magic-number-lint`: a limit literal a diff adds is warned about in merge-check (a refusal, RED, only for a client whose project.json says `"magic_numbers": "error"`; a new gate lands warning first) unless
+    it is the fallback of a setting whose line names its decision, or its line carries `lint: allow N1 <reason>`, or it
+    sits in a test file. It reads plain patterns on the names it lists, not every number (its header says which).
 - **The definition of done first:** the lot brief's fixed block (templates/lot-brief.txt, twelve « must not » lines plus
   the client's `review_catches`) is answered line by line in the report, each with a test or « n/a: why ». Check that
   each answer is true; an unanswered or wrongly « n/a » line is a finding.
+  - A client's catch is line 13 + its place in `review_catches`, and a new catch is appended last, never inserted:
+    an insertion moves every later number under the answers of lots in flight. launch-lot prints the catches with
+    their numbers in the lot brief, review-brief in the review brief. verify-lot is a backstop that leans towards
+    passing: it refuses an answer whose label (its words before a colon) shares no word with its own catch and two or
+    more with one other catch, words no third catch holds; a shift between similar catches can still pass, so the
+    reviewer reads each answer against the catch of its number.
 - **Worst use** (for any kind of work: code, documents, offers, messages before they leave): what is the worst use of
   this, by accident or on purpose, and does the change make it easier? Name it as a category, never as a working
   recipe. If the worst is acceptable, say go; if not, it is a one-way door for its owner. Reviewers only: builders
@@ -179,7 +211,8 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   stop the queue?
 - **States:** does the screen ever say something false when a load fails, or before it ends?
 - **Proof:** which guard has no negative control? Which mutant would survive? (`bin/mutant-check`'s survivors
-  and NO COVERAGE lines, when the builder ran it; else run it, `--max 10`, a few minutes.)
+  and NO COVERAGE lines, when the builder ran it; else run it, `--max 10 --no-record`, a few minutes: a reviewer's
+  run leaves the builder's record, which verify-lot reads, as it is.)
 - **Hostile files:** is every user file parsed in a bounded child process, typed from its bytes, with archive
   and page bounds? Does any error type escape the per-file catch and stop the loop?
 - **Our own oversight guards** (keep-gate, push-gate, test brakes; 13/10/2026: an « act as an attacker » brief was
@@ -203,6 +236,7 @@ the fix landed). Decision rounds are cut upstream, by asking the rule questions 
   exactly once? Is the rule in one shared helper?
 - **Phone:** was each changed screen rendered at phone widths, and were its screenshots looked at? What does the first
   screen show on a phone?
+- **Boundaries:** does this read or write another component's tables, files or internal state instead of calling its API?
 - **Data:** the same data in two places (one system of record per kind of data)? A list with no bound? A timestamp without zone? A new
   value without its label in every locale? Something the diff writes (a field, column, event, setting, file)
   that no code reads? Written-but-unread is dead work or a missing half (09/10/2026).

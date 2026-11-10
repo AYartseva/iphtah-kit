@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""mutant-check <worktree> [--base REF] [--max N] [--minutes M] [--lang java|ts|py] [--app-dir D] [--dry-run] [--keep] [--client C] [--java-home P] [--maven-args "…"] [--tests T,…] [--exclude-tests G,…]
+"""mutant-check <worktree> [--base REF] [--max N] [--minutes M] [--lang java|ts|py] [--app-dir D] [--dry-run] [--no-record] [--keep] [--client C] [--java-home P] [--maven-args "…"] [--tests T,…] [--exclude-tests G,…]
 """
 import argparse
 import fcntl
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -31,6 +32,9 @@ MUTANTS_PER_LINE = 1.5
 CAPPER = None
 NO_BOUND = ("memory cap: the test has no bound under this mutant (an endless input): give it a finite one, so the "
             "mutant fails an assertion instead of filling the memory")
+EXIT_NOT_RUN = 3
+RECORD = "mutant-check.last.json"
+RAN, NOTHING, NOT_RUN, RUNNING = "ran", "nothing to prove", "not run", "running"
 
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -170,6 +174,11 @@ def select_lines(ranked, max_mutants, per_line=MUTANTS_PER_LINE):
     ""
     budget = max(1, int(math.floor(max_mutants / per_line))) if max_mutants else len(ranked)
     return ranked[:budget]
+
+
+def all_guards(ranges):
+    ""
+    return {(p, n): 2 for p, rs in ranges.items() for s, e in rs for n in range(s, e + 1)}
 
 
 def ranges_of(lines):
@@ -419,7 +428,7 @@ def parse_stryker_json(text, ranges, root=""):
     return out
 
 
-def summarize(mutants):
+def summarize(mutants, unrun=0, bare=()):
     ""
     scoped = [m for m in mutants if m.in_scope]
     lines = [m.row() for m in scoped]
@@ -439,8 +448,131 @@ def summarize(mutants):
         tail += f"; {no_verdict} no verdict ({NO_BOUND})"
     if outside:
         tail += f"; {outside} mutant(s) outside the chosen lines run and not listed"
+    if unrun:
+        tail += f"; {unrun} not run"
+    if bare:
+        tail += "; no mutant on guard line(s): " + ", ".join(bare)
     lines.append(tail)
     return "\n".join(lines)
+
+
+
+OUTCOME = {"summary": [], "not_run": [], "nothing": [], "dry_run": False}
+
+
+def not_run(reason):
+    ""
+    if OUTCOME["dry_run"]:
+        print(f"would be NOT RUN: {reason}", flush=True)
+        return 0
+    print(f"NOT RUN: {reason}", flush=True)
+    OUTCOME["not_run"].append(reason)
+    return EXIT_NOT_RUN
+
+
+def nothing_to_prove(text):
+    ""
+    print(text, flush=True)
+    OUTCOME["nothing"].append(text.splitlines()[0][:300])
+    return 0
+
+
+def proved(text):
+    ""
+    print(text, flush=True)
+    OUTCOME["summary"].append(text.splitlines()[-1])
+
+
+VERDICTS = ("KILLED", "TIMEOUT", "SURVIVED", "NO COVERAGE")
+
+
+def verdict_of(mutants, unrun=0, last_line_only=False, chosen=None):
+    ""
+    scoped = [m for m in mutants if m.in_scope]
+    landed = {(m.path, m.line) for m in scoped}
+    guards = sorted(k for k, score in (chosen or {}).items() if score > 1)
+    bare = [f"{p}:{n}" for p, n in guards if (p, n) not in landed]
+    if not scoped:
+        if mutants:
+            print(f"  {len(mutants)} mutant(s) made outside the chosen lines, none on them", flush=True)
+        if bare:
+            return not_run(f"no mutant on the chosen guard line(s) {', '.join(bare[:10])}: the engine's report does not "
+                           "map to the diff (its file paths or class names), or its filters left those lines out")
+        return nothing_to_prove("mutant-check: the engine made no mutant on the chosen lines, all plain statements. "
+                                "Nothing to prove mechanically.")
+    text = summarize(mutants, unrun, bare)
+    proved(text.splitlines()[-1] if last_line_only else text)
+    if not any(m.status in VERDICTS for m in scoped):
+        return not_run(f"no chosen mutant got a verdict ({len(scoped)} run, {unrun} not run)")
+    return 0
+
+
+def write_record(gdir, rec):
+    ""
+    path = os.path.join(gdir, RECORD)
+    fd, tmp = tempfile.mkstemp(dir=gdir, prefix=RECORD + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, indent=1, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def recorded(worktree, gdir, run, write=True):
+    ""
+    OUTCOME.update(summary=[], not_run=[], nothing=[])
+    head = git(worktree, "rev-parse", "HEAD").strip()
+    branch = git(worktree, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    path = os.path.join(gdir, RECORD)
+    try:
+        with open(path, "rb") as fh:
+            previous = fh.read()
+    except OSError:
+        previous = None
+    if write:
+        write_record(gdir, {"head": head, "branch": branch, "status": RUNNING, "pid": os.getpid()})
+    code = EXIT_NOT_RUN
+    try:
+        code = run()
+    except SystemExit as e:
+        if e.code in (None, 0, 2, EXIT_NOT_RUN):
+            code = e.code or 0
+        else:
+            code = not_run(f"stopped (exit {e.code})" if isinstance(e.code, int) else str(e.code).strip()[-500:])
+    except KeyboardInterrupt:
+        code = not_run("interrupted")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        code = not_run(f"mutant-check failed: {e.__class__.__name__}: {e}"[:500])
+    finally:
+        if not write:
+            pass
+        elif code == 2:
+            if previous is None:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                with open(path + ".back", "wb") as fh:
+                    fh.write(previous)
+                os.replace(path + ".back", path)
+        if code != 2:
+            if code == 0 and not OUTCOME["summary"] and not OUTCOME["nothing"]:
+                code = not_run("the run ended without a verdict (no summary line, nothing said to be unprovable)")
+            status = NOT_RUN if code == EXIT_NOT_RUN or OUTCOME["not_run"] else RAN if OUTCOME["summary"] else NOTHING
+            if status == NOT_RUN:
+                code = EXIT_NOT_RUN
+            if write:
+                write_record(gdir, {"head": head, "branch": branch, "status": status, "reasons": OUTCOME["not_run"],
+                                    "summary": OUTCOME["summary"], "nothing": OUTCOME["nothing"]})
+    return code
 
 
 
@@ -513,6 +645,31 @@ def cap_said(res):
         print(f"  memory cap: {res.get('cap', '?')} met (memory events, no kill) during this run")
 
 
+MISSING_PACKAGE = re.compile(r"Cannot find (?:package|module) '([^']+)'")
+
+
+def clear_stale(path):
+    ""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def no_report_reason(engine, code, res, tail, minutes):
+    ""
+    if code == 124:
+        return f"the run exceeded --minutes {minutes}, no {engine} report"
+    if res.get("no_room") == "1":
+        return f"no room: {res.get('note', '?')}"
+    if oom_kills(res):
+        return f"the memory cap ({res.get('cap', '?')}) stopped {engine} before its report"
+    missing = MISSING_PACKAGE.search(tail or "")
+    if missing:
+        return f"{engine} crashed before mutating: cannot find package '{missing.group(1)}'"
+    return f"{engine} produced no report (exit {code})"
+
+
 def after_the_cap(mutants, res):
     ""
     if memory_hit(res):
@@ -574,7 +731,7 @@ def app_dir_of(worktree, paths):
     return "."
 
 
-def run_java(a, worktree, ranges, changed_paths, scratch, log, repo):
+def run_java(a, worktree, ranges, changed_paths, scratch, log, repo, chosen=None):
     pom_path = os.path.join(worktree, "pom.xml")
     pom = open(pom_path, encoding="utf-8").read()
     classes, excluded, methods = java_targets(worktree, ranges)
@@ -583,7 +740,7 @@ def run_java(a, worktree, ranges, changed_paths, scratch, log, repo):
     if not tests:
         print("mutant-check: no test names a changed class or method, and the branch changes no test:\n"
               "  nothing can prove these guards yet — write the test first.")
-        return 0
+        return not_run("no test covers the changed Java lines")
     java_home = a.java_home or (re.search(r"JAVA_HOME=(\S+)", repo.get("build", "")) or [None, None])[1]
     maven_args = shlex.split(a.maven_args) if a.maven_args else re.findall(r"(-P\S+)", repo.get("build", ""))
     scratch_pom = os.path.join(worktree, "pom.mutant-check.xml")
@@ -608,6 +765,8 @@ def run_java(a, worktree, ranges, changed_paths, scratch, log, repo):
     if java_home:
         env["JAVA_HOME"] = java_home
     before = git(worktree, "status", "--porcelain")
+    clear_stale(os.path.join(reports, "mutations.xml"))
+    clear_stale(cap_file)
     open(scratch_pom, "w", encoding="utf-8").write(pom_with_pit(pom))
     try:
         code, tail, secs = sh(cmd, cwd=worktree, timeout=a.minutes * 60, env=env, log=log)
@@ -628,15 +787,15 @@ def run_java(a, worktree, ranges, changed_paths, scratch, log, repo):
         if re.search(r"tests did not pass without mutation|Tests failing without mutation", tail, re.I):
             print("  the tests fail BEFORE any mutation, so nothing can be proved; fix them first "
                   "(a red suite at review wastes the review). Log: " + log)
-        else:
-            print("  no PIT report produced. Last lines of the log:\n" + tail)
-        return 0
+            return not_run("the tests fail before any mutation")
+        print("  no PIT report produced. Last lines of the log:\n" + tail)
+        return not_run(no_report_reason("PIT", code, res, tail, a.minutes))
     mutants = after_the_cap(parse_pit_xml(open(xml_path, encoding="utf-8").read(), ranges), res)
-    print(summarize(mutants))
+    code = verdict_of(mutants, chosen=chosen if chosen is not None else all_guards(ranges))
     print(f"  html: {os.path.join(reports, 'index.html')}")
     if before != after:
         print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
-    return 0
+    return code
 
 
 def project_package(app_abs, worktree, name):
@@ -659,11 +818,14 @@ def plugin_entry(pkg_dir):
 
 def stryker_install(links):
     ""
-    key = re.sub(r"\W+", "_", "|".join(f"{k}={v}" for k, v in sorted(links.items())))[-80:]
+    full = "|".join(f"{k}={v}" for k, v in sorted(links.items()))
+    key = re.sub(r"\W+", "_", full)[-40:] + "-" + hashlib.sha1(full.encode()).hexdigest()[:12]
     d = os.path.join(CACHE, f"stryker-{STRYKER_VERSION}-{key}")
     bin_ = os.path.join(d, "node_modules", ".bin", "stryker")
-    if os.path.exists(bin_):
+    if os.path.exists(bin_) and all(os.path.exists(os.path.join(d, "node_modules", k)) for k in links):
         return d, bin_
+    if os.path.exists(bin_):
+        shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d, exist_ok=True)
     deps = {"@stryker-mutator/core": STRYKER_VERSION, "@stryker-mutator/vitest-runner": STRYKER_VERSION}
     deps.update({k: "link:" + v for k, v in links.items()})
@@ -676,7 +838,7 @@ def stryker_install(links):
     return d, bin_
 
 
-def run_ts(a, worktree, ranges, scratch, log, changed_paths=(), repo=None):
+def run_ts(a, worktree, ranges, scratch, log, changed_paths=(), repo=None, chosen=None):
     ""
     by_app = {}
     for path, rs in ranges.items():
@@ -684,7 +846,7 @@ def run_ts(a, worktree, ranges, scratch, log, changed_paths=(), repo=None):
     code = 0
     for n, (app, app_ranges) in enumerate(sorted(by_app.items())):
         code = run_ts_app(a, worktree, app, app_ranges, scratch, log.replace(".log", f".{n}.log") if n else log,
-                          changed_paths, repo) or code
+                          changed_paths, repo, chosen) or code
     return code
 
 
@@ -725,12 +887,12 @@ def scratch_vitest_config(base_config, tests):
             f"export default mergeConfig(base, {{ test: {{ include: {json.dumps(tests)} }} }});\n")
 
 
-def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=None):
+def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=None, chosen=None):
     app_abs = os.path.join(worktree, app)
     vitest = os.path.join(app_abs, "node_modules", "vitest")
     if not os.path.exists(vitest):
         print(f"mutant-check: {app}/node_modules/vitest is missing — install the project first (pnpm install).")
-        return 0
+        return not_run(f"{app}/node_modules/vitest is missing")
     mutate = []
     for path, rs in ranges.items():
         rel = os.path.relpath(os.path.join(worktree, path), app_abs)
@@ -745,7 +907,7 @@ def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=No
     if not tests:
         print(f"mutant-check: ts — app {app}: no test imports {mutated_rel} and the branch changes no test there:\n"
               "  nothing can prove these guards yet — write the test first.")
-        return 0
+        return not_run(f"no test covers the changed lines of app {app}")
     scratch_config = None
     if config_file:
         scratch_config = "vitest.mutant-check.config" + os.path.splitext(config_file)[1]
@@ -786,6 +948,8 @@ def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=No
     cap_file = os.path.join(scratch, f"cap-{tag}.result")
     cmd = capped([RUN_QUEUED, "vitest", "--", stryker_bin, "run", conf_path], cap_file, repo, "ts")
     before = git(worktree, "status", "--porcelain")
+    clear_stale(report)
+    clear_stale(cap_file)
     if scratch_config:
         with open(os.path.join(app_abs, scratch_config), "w", encoding="utf-8") as f:
             f.write(scratch_vitest_config(config_file, tests))
@@ -809,15 +973,16 @@ def run_ts_app(a, worktree, app, ranges, scratch, log, changed_paths=(), repo=No
             print("  the tests fail BEFORE any mutation, so nothing can be proved:\n    "
                   + failed.group(1).strip().replace("\n", "\n    ")
                   + "\n  fix that test first (a red suite at review wastes the review).")
-        else:
-            print("  no Stryker report produced. Last lines of the log:\n" + tail)
-        return 0
+            return not_run(f"the tests of app {app} fail before any mutation")
+        print("  no Stryker report produced. Last lines of the log:\n" + tail)
+        return not_run(no_report_reason("Stryker", code, res, tail, a.minutes) + (f" (app {app})" if app != "." else ""))
     mutants = after_the_cap(parse_stryker_json(open(report, encoding="utf-8").read(), ranges,
                                                root=app if app != "." else ""), res)
-    print(summarize(mutants))
+    mine = {k: v for k, v in (chosen if chosen is not None else all_guards(ranges)).items() if k[0] in ranges}
+    code = verdict_of(mutants, chosen=mine)
     if before != after:
         print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
-    return 0
+    return code
 
 
 
@@ -1227,12 +1392,11 @@ def run_py(a, worktree, sources, files, ranked, changed_paths, log, repo):
     excluded = [t for t in tests if any(fnmatch.fnmatch(t, g) or fnmatch.fnmatch(t + ".py", g) for g in a.exclude_tests or [])]
     tests = [t for t in tests if t not in excluded]
     if not mutants:
-        print("mutant-check: py — no compiling mutant on the chosen lines. Nothing to prove mechanically.")
-        return 0
+        return nothing_to_prove("mutant-check: py — no compiling mutant on the chosen lines. Nothing to prove mechanically.")
     if not tests:
         print(f"mutant-check: py — no module under {tests_dir}/ names {paths} and the branch changes no test"
               + (f" (excluded: {excluded})" if excluded else "") + ":\n  nothing can prove these guards yet — write the test first.")
-        return 0
+        return not_run(f"no test covers {', '.join(paths)}")
     print(f"mutant-check: py — {len(mutants)} mutant(s) in {paths}; tests {tests}" + (f"; excluded {excluded}" if excluded else ""))
     scores = {(path, lineno): (score, why) for score, path, lineno, why in ranked}
     for path, lineno, desc, new in mutants:
@@ -1259,22 +1423,22 @@ def run_py(a, worktree, sources, files, ranked, changed_paths, log, repo):
             originals[p] = head
         cap, no_room = admit_run(repo, "py")
         if no_room:
-            print(f"  not run: {no_room}: no verdict (exit 87, the memory was never there).")
-            return 0
+            print(f"  not run: {no_room}: no verdict (the memory was never there).")
+            return not_run(f"no room: {no_room}")
         slot = acquire_slot("py")
         deadline = time.time() + a.minutes * 60
         status, killer, base_secs = py_run_tests(worktree, tests, a.minutes * 60, log, tests_dir, repo, cap_kib=cap)
         if status == "timeout":
             print(f"  the tests alone exceed --minutes {a.minutes}; nothing can be proved. Raise --minutes or give --tests.")
-            return 0
+            return not_run(f"the tests alone exceed --minutes {a.minutes}")
         if status == "oom":
             print(f"  the tests alone fill the memory cap ({killer}, what all the builds here may take) before any "
                   "mutation; nothing can be proved. Run it when more memory is free, or give --tests. Log: " + log)
-            return 0
+            return not_run(f"the tests alone fill the memory cap ({killer})")
         if status != "green":
             print("  the tests fail BEFORE any mutation" + (f" ({killer})" if killer else "") +
                   ", so nothing can be proved; fix them first (a red suite at review wastes the review). Log: " + log)
-            return 0
+            return not_run("the tests fail before any mutation" + (f" ({killer})" if killer else ""))
         per_mutant = max(30, int(base_secs * 5) + 10)
         before = git(worktree, "status", "--porcelain")
         old_term, old_hup = signal.signal(signal.SIGTERM, _raise_exit), signal.signal(signal.SIGHUP, _raise_exit)
@@ -1299,11 +1463,14 @@ def run_py(a, worktree, sources, files, ranked, changed_paths, log, repo):
         finally:
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGHUP, old_hup)
-        print(summarize(results).splitlines()[-1])
+        if not results:
+            print(f"  log {log}")
+            return not_run(f"--minutes {a.minutes} spent before any mutant ran")
+        code = verdict_of(results, unrun=len(mutants) - len(results), last_line_only=True)
         print(f"  log {log}")
         if git(worktree, "status", "--porcelain") != before:
             print("  WARNING: the worktree's git status changed during the run — look at it before trusting it.")
-        return 0
+        return code
     finally:
         if slot is not None:
             os.close(slot)
@@ -1385,6 +1552,9 @@ def main(argv=None):
     ap.add_argument("--tests", type=lambda s: s.split(","), help="PIT targetTests, comma-separated (default: chosen statically)")
     ap.add_argument("--exclude-tests", type=lambda s: s.split(","), help="test globs never to run (the pom's <exclude>s are always added)")
     ap.add_argument("--dry-run", action="store_true", help="choose and print, run nothing")
+    ap.add_argument("--no-record", action="store_true",
+                    help="a reviewer's run: the same verdict and exit code, but the worktree's record (the builder's, "
+                         "read by verify-lot) is left as it is")
     ap.add_argument("--keep", action="store_true", help="keep the scratch pom in the worktree (untracked) for a by-hand run")
     a = ap.parse_args(argv)
 
@@ -1407,8 +1577,11 @@ def main(argv=None):
         print(f"mutant-check: REFUSED — another mutant-check is running on this worktree (lock {gdir}/mutant-check.lock): "
               "a run is in progress, its marker is left alone; two runs would mutate and restore over each other.")
         return 2
+    OUTCOME["dry_run"] = a.dry_run
     try:
-        return _main_locked(a, ap, worktree, gdir)
+        if a.dry_run:
+            return _main_locked(a, ap, worktree, gdir)
+        return recorded(worktree, gdir, lambda: _main_locked(a, ap, worktree, gdir), write=not a.no_record)
     finally:
         os.close(lock)
 
@@ -1435,9 +1608,8 @@ def _main_locked(a, ap, worktree, gdir):
         ext = (".java",) if lang == "java" else tuple(e for e in SOURCE_EXT if e != ".java")
         source_ranges = {p: r for p, r in source_ranges.items() if p.endswith(ext)}
     if not source_ranges:
-        print(f"mutant-check: {base}...HEAD adds no source line to mutate ({len(changed_paths)} file(s) changed, "
-              "tests, locales and config only). Nothing to prove.")
-        return 0
+        return nothing_to_prove(f"mutant-check: {base}...HEAD adds no source line to mutate ({len(changed_paths)} file(s) "
+                                "changed, tests, locales and config only). Nothing to prove.")
 
     files, sources, skipped = {}, {}, []
     for path, rs in source_ranges.items():
@@ -1455,6 +1627,7 @@ def _main_locked(a, ap, worktree, gdir):
     ranked = rank_lines(files, cfg.get("money_terms") or ())
     chosen = select_lines(ranked, a.max) if lang != "py" else ranked
     ranges = ranges_of(chosen)
+    scores = {(path, lineno): score for score, path, lineno, _ in chosen}
     if skipped:
         print(f"mutant-check: {len(skipped)} file(s) skipped, not readable as UTF-8: {', '.join(skipped)}")
     print(f"mutant-check: {base}...HEAD — {sum(len(v) for v in files.values())} added source line(s) in "
@@ -1462,15 +1635,18 @@ def _main_locked(a, ap, worktree, gdir):
           (f"{len(chosen)} chosen for --max {a.max}:" if lang != "py" else f"--max {a.max} mutant(s), best lines first"))
     for score, path, lineno, why in (chosen if lang != "py" else []):
         print(f"  [{score:2d} {why:<14}] {path}:{lineno}  {files[path][[n for n, _ in files[path]].index(lineno)][1].strip()[:90]}")
+    if not chosen and lang != "py":
+        return nothing_to_prove(f"mutant-check: {lang} — no added line is worth mutating (imports, types, annotations, "
+                                "declarations only). Nothing to prove mechanically.")
 
     scratch = os.path.join(CACHE, "runs", time.strftime("%Y%m%d-%H%M%S") + f"-{os.path.basename(worktree)}")
     os.makedirs(scratch, exist_ok=True)
     log = os.path.join(scratch, "run.log")
     if lang == "java":
-        return run_java(a, worktree, ranges, changed_paths, scratch, log, repo)
+        return run_java(a, worktree, ranges, changed_paths, scratch, log, repo, chosen=scores)
     if lang == "py":
         return run_py(a, worktree, sources, files, chosen, changed_paths, log, repo)
-    return run_ts(a, worktree, ranges, scratch, log, changed_paths, repo)
+    return run_ts(a, worktree, ranges, scratch, log, changed_paths, repo, chosen=scores)
 
 
 if __name__ == "__main__":

@@ -167,6 +167,8 @@ RUN_QUEUED_FALLBACK = {
 }
 DISK_LOW_FALLBACK = {
     "disk_low_gib": 10,
+    "disk_cache_timeout_s": 600,
+    "disk_archive_days": 30,
 }
 PARAM_FALLBACK = {**RUN_QUEUED_FALLBACK, **DISK_LOW_FALLBACK}
 _SAID = set()
@@ -193,6 +195,36 @@ def param(name, path=None):
             print(f"machine file: {bad}: using {fallback}", file=sys.stderr, flush=True)
         return fallback
     return v
+
+
+def claude_account(config_dir, path=None):
+    ""
+    real = lambda d: os.path.realpath(os.path.expanduser(d))
+    bad = None
+    try:
+        data = read_file(path)
+        accounts = ((data or {}).get("overrides") or {}).get("claude_accounts")
+        if accounts is not None and not isinstance(accounts, dict):
+            bad = "overrides.claude_accounts is not an object"
+        want = real(config_dir)
+        found = next((e for k, e in (accounts or {}).items() if isinstance(k, str) and real(k) == want), None) \
+            if bad is None else None
+    except (OSError, ValueError, AttributeError) as e:
+        bad, found = f"the machine file cannot be read ({e.__class__.__name__})", None
+    if bad is None and found is not None and not isinstance(found, dict):
+        bad, found = f"the entry of {config_dir} is not an object", None
+    if bad and ("claude_accounts", bad) not in _SAID:
+        _SAID.add(("claude_accounts", bad))
+        print(f"machine file: {bad}: no plan known for that account", file=sys.stderr, flush=True)
+    out = {}
+    plan, budget, rst = ((found or {}).get(k) for k in ("plan", "week_budget", "reset"))
+    if isinstance(plan, str) and plan.strip():
+        out["plan"] = plan.strip()
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool) and 0 < budget < float("inf"):
+        out["week_budget"] = float(budget)
+    if isinstance(rst, str) and rst.strip():
+        out["reset"] = rst.strip()
+    return out
 
 
 def run_queued_param(name, path=None):

@@ -41,7 +41,11 @@ refuses the lot while a line is missing or an « n/a » has no reason after it>
 11. Zero waste: the run ends with a clean exit code, its temporary files removed and no orphan process or container
    left behind. If /tmp grew by 1 MB or a container lingers, the status is FAILED.
 12. A surgical diff: no duplicated file (_v2, _new, _old, copy), no change outside the strict scope of the issue.
-Plus the client's own lines: project.json `review_catches`, numbered 13, 14… in their order.
+Plus the client's own lines, project.json `review_catches` numbered on in their order (a new catch goes last, so a
+number never moves); answer each under the number shown here. Open each answer with its catch's words before a colon
+(`13. timestamps without zone: n/a, …`): verify-lot refuses a label that shares no word with its own catch and two
+or more with one other catch, words no third catch holds; a shift between similar catches can still pass.
+$catches
 A lot with no code (a demo, a count, a test on the platform, research: the ledger's type, or a branch that changes
 no file) answers 3, 7, 8, 9 and 11 only.
 
@@ -56,6 +60,8 @@ no file) answers 3, 7, 8, 9 and 11 only.
 - Lock your worktree while you build, right after `git worktree add` (or first thing, if the session made it):
   git -C <worktree> worktree lock --reason "$lot building" <worktree>   (ship-lot unlocks it once pushed; by hand: git worktree unlock <worktree>)
 - Never push, never post, never message anyone.
+- Never work around a refused guard: when keep-gate, push-gate or any hook refuses a command, do not reach the same
+  effect another way (another verb, a script, rm -f then rmdir); stop, say what was refused and why you needed it.
 
 ## Build and test
 $build

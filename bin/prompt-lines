@@ -154,7 +154,7 @@ def my_due_loops(path, now, limit=8):
     out = []
     for raw in open(path, encoding="utf-8"):
         p = lp.parse(raw.strip())
-        if not p or p["mark"] != " " or p["acts"] != "vela" or not p["when"]:
+        if not p or p["mark"] != " " or not lp.agent_acts(p["acts"]) or not p["when"]:
             continue
         try:
             due = dt.datetime.strptime(p["when"] if " " in p["when"] else p["when"] + " 00:00",

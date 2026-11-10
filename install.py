@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """install.py — put this kit into your Claude Code, safely; take it out again, whole.
 
-    python3 install.py [--role lead-dev|dev] [--dry-run] [--yes] [--home DIR]
+    python3 install.py [--role lead-dev|dev] [--agent claude|codex] [--dry-run] [--yes] [--home DIR]
                        [--client NAME --login LOGIN --repo NAME=PATH[,github=OWNER/REPO][,base=main][,build=CMD]]…
                        [--client-file PATH] [--context PATH]
     python3 install.py --uninstall [--dry-run] [--home DIR]
@@ -28,6 +28,15 @@ Before the first write that changes CLAUDE.md or settings.json, both are copied,
 entries out again (byte for byte from the backup when nothing else changed since), and leaves your done.json,
 works-for.md and the kit's state folder where they are, named.
 
+--agent codex (the default is claude) puts the same kit into Codex CLI instead of Claude Code, with the same care: steps 1,
+4 and 5 are the same (the kit's folder is shared by both agents); step 2 appends the marked block to ~/.codex/AGENTS.md (Codex
+has no @import, so the kit's texts are written into the block; what you wrote stays before it) and step 3 merges the role's
+hooks into ~/.codex/hooks.json, each run through a small shim (bin/_codex_hooks.py), with the role's shell rules as one more
+gate. One difference you should know: Codex lets a command through when a hook itself fails or times out (Claude Code blocks
+it), so on Codex the gates guard against accidents, not against an adversary. Codex also runs a hook only once it is trusted,
+and skips an untrusted one without a word: the installer prints the one command that trusts the kit's hooks (and no other).
+Run the installer for each agent you use; --uninstall takes the kit out of both.
+
 A settings.json that is not plain JSON (comments, trailing commas) is left alone and named: nothing is written.
 Installing is a choice: in a terminal the plan is shown and confirmed first; elsewhere --yes stands for your yes.
 """
@@ -41,12 +50,20 @@ import shutil
 import stat
 import subprocess
 import sys
+import importlib.util
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 KIT = ".claude/iphtah-kit"
 KIT_STATE = ".local/state/iphtah-kit"
 BACKUPS = ".claude/iphtah-kit-backup"
 ROLES = ("lead-dev", "dev")
+AGENTS = ("claude", "codex")
+# The Codex path: the files the publish made per role (codex/<role>.*); the constants below mirror the publish's, which a test holds equal.
+CODEX_DIR = ".codex"
+DENY_FILE = "codex-deny.json"                 # in the kit's folder: the rules of the role's deny gate
+AGENTS_WORKS_FOR = "@@works-for.md@@"         # where the person's own works-for.md goes in codex/<role>.agents.md
+CODEX_DOC_LIMIT = 32 * 1024                   # Codex's own default project_doc_max_bytes: what it reads of instruction files
+CODEX_DOC_BUDGET = 29 * 1024                  # what the kit's block may take of it
 # A build command that builds nothing: merge-check would go GREEN on it and push-gate would then let any push through.
 NOOP_BUILDS = {"", "true", ":", "/bin/true", "/usr/bin/true", "exit 0"}
 NO_BUILD = ("needs its full build command (build=COMMAND, run from the repository's root): without one, or with a "
@@ -125,19 +142,31 @@ def inside(root, rel):
 
 # --- the kit's files ------------------------------------------------------------------------------------------
 
-def kit_plan(home, src, role):
+def repo_only(rel, codex):
+    """True for a file of this repository that the kit's folder does not take: its own README, CONTRIBUTING and installer, and
+    the Codex path's install sources (codex/, the hooks merge, the note agents-codex.md: AGENTS.md holds the note). The Codex
+    shim goes into the folder only for a home that runs the kit on Codex, so a Claude install is exactly what it was."""
+    return rel in REPO_ONLY or rel == "agents-codex.md" or rel.startswith("codex/") or rel == "bin/_hooks_merge.py" \
+        or (rel == "bin/_codex_hooks.py" and not codex)
+
+
+def kit_plan(home, src, role, deny=None, codex=False):
     """{home path: text or None (remove)} for the kit folder, and the files that are theirs and stay. The home's
-    VERSION lists only what was installed, plus the role."""
+    VERSION lists only what was installed, plus the role. `deny` (Codex only): the text of codex-deny.json, the rules of
+    the role's deny gate, written into the folder and listed in VERSION so an update or an uninstall knows it."""
     root = os.path.join(home, KIT)
     want = {}
     for rel in stamp_files(read(os.path.join(src, STAMP))):
-        if rel in REPO_ONLY or not inside(src, rel):
+        if repo_only(rel, codex) or not inside(src, rel):
             continue
         text = read(os.path.join(src, rel))
         if text is not None:
             want[rel] = text
+    if deny is not None:
+        want[DENY_FILE] = deny
     want[STAMP] = "".join(l + "\n" for l in (read(os.path.join(src, STAMP)) or "").splitlines()
-                          if not l.startswith(("file ", "role ")) or l[len("file "):] in want) + f"role {role}\n"
+                          if not l.startswith(("file ", "role ")) or l[len("file "):] in want) \
+        + (f"file {DENY_FILE}\n" if deny is not None else "") + f"role {role}\n"
     news = read(os.path.join(src, WHATS_NEW))
     if news is not None:
         want[WHATS_NEW] = news
@@ -197,7 +226,7 @@ def without_block(text):
 
 # --- settings.json: add only --------------------------------------------------------------------------------
 
-def load_settings(path):
+def load_settings(path, by_hand="merge the role's settings by hand from roles/settings/"):
     text = read(path)
     if text is None:
         return {}, None, 2
@@ -205,8 +234,7 @@ def load_settings(path):
         d = json.loads(text)
     except ValueError as e:
         sys.exit(f"install.py: {path} is not plain JSON ({e}); it is left as it is and nothing is written. Make it "
-                 "plain JSON (no comments, no trailing commas) and run again, or merge the role's settings by hand "
-                 "from roles/settings/.")
+                 f"plain JSON (no comments, no trailing commas) and run again, or {by_hand}.")
     if not isinstance(d, dict):
         sys.exit(f"install.py: {path} does not hold an object; left as it is, nothing written")
     return d, text, indent_of(text)
@@ -223,6 +251,27 @@ def indent_of(text):
 def dump_settings(d, indent, like):
     out = json.dumps(d, indent=indent, ensure_ascii=False)
     return out + ("\n" if not like or like.endswith("\n") else "")
+
+
+def tools_of(matcher):
+    """The tools a hook entry's matcher names; None for every tool (no matcher, "" or "*"). An installed hook
+    counts as present for an entry only when it covers the entry's tools, so Monitor added to a hook that is already
+    installed for Bash is added on an update, not skipped because the command is there."""
+    return None if matcher in (None, "", "*") else set(str(matcher).split("|"))
+
+
+def installed_for(entry, have):
+    """True when an installed entry already runs a command of `entry` for all the tools `entry` names."""
+    want = tools_of(entry.get("matcher"))
+    for e in have:
+        if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
+            continue
+        got = tools_of(e.get("matcher"))
+        if got is None or (want is not None and want <= got):
+            if any(isinstance(h, dict) and h.get("command") in {x.get("command") for x in entry.get("hooks", [])}
+                   for h in e["hooks"]):
+                return True
+    return False
 
 
 def merge_settings(current, add):
@@ -253,10 +302,8 @@ def merge_settings(current, add):
         if event not in hooks:
             added["created"].append(f"hooks.{event}")
         have = hooks.setdefault(event, [])
-        commands = {h.get("command") for e in have if isinstance(e, dict)
-                    for h in (e.get("hooks") if isinstance(e.get("hooks"), list) else []) if isinstance(h, dict)}
         for entry in entries:
-            if not any(h.get("command") in commands for h in entry.get("hooks", [])):
+            if not installed_for(entry, have):
                 have.append(entry)
                 added["hooks"].append([event] + [h.get("command") for h in entry.get("hooks", [])])
     return out, added
@@ -290,19 +337,134 @@ def unmerge_settings(current, added):
     return out
 
 
+# --- the Codex path: ~/.codex/AGENTS.md (one block) and ~/.codex/hooks.json (the kit's hooks) --------------------------
+# The files come from the publish, made by the same code as `onboard --agent codex` (codex/<role>.*): this installer only
+# merges them, as it merges Claude's. Its own shim (bin/_codex_hooks.py) and the method's hooks merge (bin/_hooks_merge.py)
+# are loaded from this clone, never from the person's PATH.
+
+def load_module(path, name):
+    """A module of this clone's bin/, loaded without leaving a __pycache__ in the clone."""
+    if not os.path.isfile(path):
+        return None
+    old, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)   # not load_module(): Python removes it in 3.15
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.dont_write_bytecode = old
+
+
+def codex_modules(home=None):
+    """(the shim, the hooks merge) from this clone's bin/, else (the shim only) the home's kit; None for what is not found."""
+    roots = [os.path.join(HERE, "bin")] + ([os.path.join(home, KIT, "bin")] if home else [])
+    shim = next((m for m in (load_module(os.path.join(r, "_codex_hooks.py"), "_codex_hooks") for r in roots) if m), None)
+    return shim, load_module(os.path.join(HERE, "bin", "_hooks_merge.py"), "_hooks_merge")
+
+
+def codex_shim_in(home):
+    """True when the home's Codex hooks.json calls the kit's shim."""
+    return "/_codex_hooks.py run " in (read(os.path.join(home, CODEX_DIR, "hooks.json")) or "")
+
+
+def codex_files(src, role):
+    """(hooks, notes, AGENTS.md template, deny file text) the publish made for `role`; exits when this clone has none."""
+    texts = [read(os.path.join(src, "codex", f"{role}.{ext}")) for ext in ("hooks.json", "agents.md", "deny.json")]
+    if None in texts or not all(os.path.isfile(os.path.join(src, "bin", f)) for f in ("_codex_hooks.py", "_hooks_merge.py")):
+        sys.exit(f"install.py: this kit has no Codex files for {role} (codex/{role}.*, bin/_codex_hooks.py, bin/_hooks_merge.py): "
+                 "pull the repository again, or install with --agent claude")
+    spec = json.loads(texts[0])
+    return spec["hooks"], spec.get("notes", []), texts[1], texts[2]
+
+
+def codex_block(template, works_for, old_md):
+    """The block for ~/.codex/AGENTS.md: the template with the person's own works-for.md written in. Codex reads instruction
+    files up to CODEX_DOC_LIMIT bytes and drops the rest silently; the kit's block comes last, so a block that does not fit
+    would be the part lost: refused, nothing written."""
+    if template.count(AGENTS_WORKS_FOR) != 1:
+        sys.exit("install.py: the kit's AGENTS.md text does not hold its works-for.md marker once: pull the repository again")
+    body = template.replace(AGENTS_WORKS_FOR, works_for.strip(), 1)
+    block = BLOCK_START + "\n" + body.rstrip("\n") + "\n" + BLOCK_END + "\n"
+    new = with_block(old_md, block)
+    if len(block.encode("utf-8")) > CODEX_DOC_BUDGET or len(new.encode("utf-8")) > CODEX_DOC_LIMIT:
+        sys.exit(f"install.py: ~/{CODEX_DIR}/AGENTS.md would be {len(new.encode('utf-8'))} bytes (the kit's block "
+                 f"{len(block.encode('utf-8'))}), over what Codex reads of an instruction file ({CODEX_DOC_LIMIT}, "
+                 f"project_doc_max_bytes) or the {CODEX_DOC_BUDGET} the kit may take: Codex would drop the end silently. "
+                 "Shorten works-for.md or your own AGENTS.md, then run again; nothing written")
+    return new
+
+
+def merge_codex_hooks(current, hooks, shim, merge):
+    """`current` (a hooks.json) with the kit's `hooks` it lacks, and a hook of an earlier mapping of the same command retired:
+    the merge `onboard --agent codex` makes, by the same code."""
+    d = json.loads(json.dumps(current))
+    merge.merge(hooks, shim.stale_hooks(hooks, d), d, out=lambda *_: None, can_run=lambda _c: True)
+    return d
+
+
+def unmerge_codex_hooks(current, shim):
+    """`current` without the hooks the kit wrote (shim.is_kit_command: its shim, from the kit's bin/, running a tool of the
+    kit's; the person's own hooks, even one that borrows the shim's name, stay). An event or `hooks` that this empties goes."""
+    if not isinstance(current, dict):   # valid JSON that is not an object ([], 3): not ours, left exactly as it is
+        return current
+    out = json.loads(json.dumps(current))
+    hooks = out.get("hooks")
+    if shim is None or not isinstance(hooks, dict):
+        return out
+    removed = False
+    for event in list(hooks):
+        entries = hooks[event]
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for e in entries:
+            hs = e.get("hooks") if isinstance(e, dict) else None
+            left = [h for h in hs if not (isinstance(h, dict) and shim.is_kit_command(h.get("command")))] \
+                if isinstance(hs, list) else None
+            if left is None or len(left) == len(hs):
+                kept.append(e)
+                continue
+            removed = True
+            if left:
+                kept.append(dict(e, hooks=left))
+        if kept:
+            hooks[event] = kept
+        elif entries:
+            hooks.pop(event)
+    if removed and not hooks:
+        out.pop("hooks")
+    return out
+
+
 # --- the client file ---------------------------------------------------------------------------------------------
 
+OPTIONS = ("github", "base", "build", "protected")
+
+
 def parse_repo(spec):
+    """`NAME=PATH[,github=OWNER/REPO][,base=BRANCH][,build=COMMAND][,protected=A+B]`. A build= command may contain commas
+    (`mvn -pl core,web verify`, `-Dtest=A,B`); only a later `github=`, `base=`, `build=` or `protected=` ends it. For a
+    command that itself holds one of those four, use --client-file."""
     name, _, rest = spec.partition("=")
     if not name or not rest:
         sys.exit(f"install.py: --repo wants NAME=PATH[,github=OWNER/REPO][,base=BRANCH][,build=COMMAND]: {spec!r}")
     parts = rest.split(",")
     repo = {"path": parts[0], "base": "main"}
+    last = None   # the key whose value the last piece belongs to
     for part in parts[1:]:
         k, _, v = part.partition("=")
-        if k not in ("github", "base", "build", "protected"):
+        # A build command is free text and may hold commas (`mvn -pl core,web verify`, `-Dtest=A,B`): after a build=, a piece
+        # that does not start with a known key and « = » is the rest of that command, comma included (an outside
+        # user's report, 06/11/2026). Only a build continues: any other key with a stray piece, or a piece before
+        # any key, still says « unknown key », so a mistyped option is named instead of swallowed into a path or a branch.
+        if last == "build" and not (k in OPTIONS and "=" in part):
+            repo["build"] += "," + part
+            continue
+        if k not in OPTIONS:
             sys.exit(f"install.py: --repo {name}: unknown key {k!r} (github, base, build, protected)")
         repo[k] = v.split("+") if k == "protected" else v
+        last = k
     repo.setdefault("protected", [repo["base"]])
     if is_noop_build(repo.get("build")):
         sys.exit(f"install.py: --repo {name.strip()} {NO_BUILD}")
@@ -383,19 +545,34 @@ def diff(path, old, new):
 
 
 def plan_install(a, home, src):
-    md_path = os.path.join(home, ".claude", "CLAUDE.md")
-    st_path = os.path.join(home, ".claude", "settings.json")
+    codex = a.agent == "codex"
+    names = ("AGENTS.md", "hooks.json") if codex else ("CLAUDE.md", "settings.json")
+    md_path = os.path.join(home, CODEX_DIR if codex else ".claude", names[0])
+    st_path = os.path.join(home, CODEX_DIR if codex else ".claude", names[1])
     writable_or_die(md_path)
     writable_or_die(st_path)
     old_md = read(md_path)
-    new_md = with_block(old_md, block_text(src, a.role, a.context))
-    old_obj, old_st, indent = load_settings(st_path)
-    role_settings = read(os.path.join(src, "roles", "settings", f"{a.role}.settings.json"))
-    if role_settings is None:
-        sys.exit(f"install.py: {src}/roles/settings/{a.role}.settings.json is missing: this kit has no settings for {a.role}")
-    new_obj, added = merge_settings(old_obj, json.loads(role_settings))
+    deny, notes = None, []
+    if codex:
+        hooks, notes, template, deny = codex_files(src, a.role)
+        shim, merge = codex_modules()
+        works_for = read(os.path.join(home, KIT, "works-for.md"))
+        if works_for is None:
+            works_for = read(os.path.join(src, "works-for.md")) or ""
+        new_md = codex_block(template, works_for, old_md or "")
+        old_obj, old_st, indent = load_settings(st_path, "merge the kit's hooks by hand from codex/*.hooks.json")
+        new_obj, added = merge_codex_hooks(old_obj, hooks, shim, merge), {"deny": [], "hooks": [], "created": []}
+    else:
+        new_md = with_block(old_md, block_text(src, a.role, a.context))
+        old_obj, old_st, indent = load_settings(st_path)
+        role_settings = read(os.path.join(src, "roles", "settings", f"{a.role}.settings.json"))
+        if role_settings is None:
+            sys.exit(f"install.py: {src}/roles/settings/{a.role}.settings.json is missing: this kit has no settings for {a.role}")
+        new_obj, added = merge_settings(old_obj, json.loads(role_settings))
+        if codex_shim_in(home):   # the home also runs the kit on Codex: its deny gate follows the role, and fails closed without its file
+            deny = read(os.path.join(src, "codex", f"{a.role}.deny.json"))
     new_st = old_st if new_obj == old_obj and old_st is not None else dump_settings(new_obj, indent, old_st)
-    kit, kept = kit_plan(home, src, a.role)
+    kit, kept = kit_plan(home, src, a.role, deny, codex or codex_shim_in(home))
     clients = os.path.join(home, KIT, "clients")
     existing = [f for f in (os.listdir(clients) if os.path.isdir(clients) else [])
                 if os.path.isfile(os.path.join(clients, f, "project.json"))]
@@ -403,7 +580,7 @@ def plan_install(a, home, src):
     if cf:
         kit[cf[0]] = cf[1]
     return dict(md_path=md_path, old_md=old_md, new_md=new_md, st_path=st_path, old_st=old_st, new_st=new_st,
-                added=added, kit=kit, kept=kept, client=cf, existing=existing)
+                added=added, kit=kit, kept=kept, client=cf, existing=existing, names=names, notes=notes)
 
 
 def show_install(p, home):
@@ -435,6 +612,8 @@ def show_install(p, home):
         if read(path) != text:
             changes += 1
             print(f"{'+' if read(path) is None else '~'} {path} (a user timer, every 5 minutes: what this account's processes talk to, kept on this machine only, in {os.path.join(home, KIT_STATE, 'egress.jsonl')}; started with systemctl --user enable --now iphtah-kit-egress.timer)")
+    for note in p["notes"]:
+        print(f"! not on Codex: {note}")
     if p["client"] is None:
         if p["existing"]:
             print(f"= client file kept: {', '.join(p['existing'])} (yours)")
@@ -474,7 +653,7 @@ def enable_egress_timer(home):
               "systemctl --user enable --now iphtah-kit-egress.timer")
 
 
-def backup(home, p, role):
+def backup(home, p, role, agent="claude"):
     folder = os.path.join(home, BACKUPS, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     n = 0
     while os.path.exists(folder + (f"-{n}" if n else "")):
@@ -482,12 +661,14 @@ def backup(home, p, role):
     folder += f"-{n}" if n else ""
     os.makedirs(folder)
     manifest = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "role": role, "files": {}}
-    for name, path, old, new in (("CLAUDE.md", p["md_path"], p["old_md"], p["new_md"]),
-                                 ("settings.json", p["st_path"], p["old_st"], p["new_st"])):
+    for name, path, old, new in ((p["names"][0], p["md_path"], p["old_md"], p["new_md"]),
+                                 (p["names"][1], p["st_path"], p["old_st"], p["new_st"])):
         if old is not None:
             shutil.copy2(path, os.path.join(folder, name))
         manifest["files"][name] = {"existed": old is not None, "after": sha(new) if old != new else None}
     manifest["added"] = p["added"]
+    if agent != "claude":
+        manifest["agent"] = agent
     with open(os.path.join(folder, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     return folder
@@ -508,6 +689,9 @@ def write_text(path, text):
 
 def do_install(a, home, src):
     a.role = a.role or installed_role(home) or ROLES[0]
+    if a.agent == "codex" and a.context:
+        sys.exit("install.py: --context is an @import line, which Codex lacks: Codex reads the project's own AGENTS.md from "
+                 "the client's repository. Leave --context out with --agent codex")
     p = plan_install(a, home, src)
     p["egress"] = egress_units(home, src)
     changes = show_install(p, home)
@@ -517,6 +701,10 @@ def do_install(a, home, src):
     if not changes:
         print("\nNothing to do: the kit is installed as it is in this repository.")
         return 0
+    if a.agent == "codex" and not shutil.which("python3"):   # every hook of the kit runs through python3; Codex lets a call through when its hook fails
+        sys.exit("install.py: python3 is not on the PATH, and every Codex hook of the kit runs through it. Codex does NOT stop a "
+                 "call whose hook failed, so the gates would silently be off. Install python3 (macOS: xcode-select --install), "
+                 "then run again; nothing written")
     if not a.yes:
         if not sys.stdin.isatty():
             print("\nNothing written: add --yes to install what is listed above (the person's yes).")
@@ -526,7 +714,7 @@ def do_install(a, home, src):
             return 0
     folder = None
     if p["old_md"] != p["new_md"] or p["old_st"] != p["new_st"]:
-        folder = backup(home, p, a.role)
+        folder = backup(home, p, a.role, a.agent)
     for path, text in sorted(p["kit"].items()):
         if text is None:
             os.remove(path)
@@ -543,7 +731,13 @@ def do_install(a, home, src):
         for path, text in p["egress"].items():
             write_text(path, text)
         enable_egress_timer(home)
-    print("\nwritten." + (f" Your CLAUDE.md and settings.json as they were: {folder}" if folder else ""))
+    print("\nwritten." + (f" Your {p['names'][0]} and {p['names'][1]} as they were: {folder}" if folder else ""))
+    if a.agent == "codex":
+        print("Codex runs these hooks only once they are trusted, and skips an untrusted one without a word. Trust them (the "
+              f"kit's, no other) with:\n  CODEX_HOME={os.path.join(home, CODEX_DIR)} python3 "
+              f"{os.path.join(home, KIT, 'bin', '_codex_hooks.py')} trust\n"
+              "and check with `... status`. Run both again after each update. Edit works-for.md as you wish, then run this "
+              "installer again to copy it into AGENTS.md.")
     return 0
 
 
@@ -564,7 +758,8 @@ def backups(home):
 
 
 def plan_uninstall(home):
-    """What leaves: the kit's files, and the kit's part of CLAUDE.md and settings.json. Once that part is out, a
+    """What leaves: the kit's files, and the kit's part of CLAUDE.md and settings.json (and of Codex's AGENTS.md and hooks.json,
+    where the kit was installed with --agent codex). Once that part is out, a
     backup copy that holds exactly what is left is restored byte for byte (their formatting back; a copy taken at
     an update holds an earlier kit, so it never matches); a file that did not exist before the first install and
     holds nothing else is removed; otherwise the file is rewritten without the kit's part, the rest untouched."""
@@ -574,22 +769,27 @@ def plan_uninstall(home):
         for k in added:
             added[k] += [x for x in m.get("added", {}).get(k, []) if x not in added[k]]
     absent_before = {name for _, m in saved for name, info in m.get("files", {}).items() if not info.get("existed")}
+    touched = {name for _, m in saved for name in m.get("files", {})}   # the files an install of the kit ever changed
     out = {}   # path: text or None (remove)
-    for name in ("CLAUDE.md", "settings.json"):
-        path = os.path.join(home, ".claude", name)
+    shim = codex_modules(home)[0]
+    for name, folder_name in (("CLAUDE.md", ".claude"), ("settings.json", ".claude"), ("AGENTS.md", CODEX_DIR),
+                              ("hooks.json", CODEX_DIR)):
+        path = os.path.join(home, folder_name, name)
         now = read(path)
         if now is None:
             continue
-        writable_or_die(path)
-        if name == "CLAUDE.md":
+        if folder_name == ".claude":
+            writable_or_die(path)
+        if name in ("CLAUDE.md", "AGENTS.md"):
             new, new_obj, empty = without_block(now), None, not without_block(now).strip()
         else:
             try:
                 d = json.loads(now)
             except ValueError:
-                print(f"! {path} is not plain JSON: left as it is (the kit's entries, if any, are yours to remove)")
+                if folder_name == ".claude" or name in touched:   # a Codex file the kit never touched is not ours to talk about
+                    print(f"! {path} is not plain JSON: left as it is (the kit's entries, if any, are yours to remove)")
                 continue
-            new_obj = unmerge_settings(d, added)
+            new_obj = unmerge_settings(d, added) if name == "settings.json" else unmerge_codex_hooks(d, shim)
             new, empty = (now if new_obj == d else dump_settings(new_obj, indent_of(now), now)), new_obj == {}
         restore = None
         for folder, _ in saved:
@@ -610,6 +810,8 @@ def plan_uninstall(home):
             out[path] = None
         elif new != now:
             out[path] = new
+        if path in out and folder_name != ".claude":   # Codex's files are checked only when the kit changes them
+            writable_or_die(path)
     folder = saved[0][0] if saved else None
     root = os.path.join(home, KIT)
     for rel in stamp_files(read(os.path.join(root, STAMP))) + [STAMP, WHATS_NEW]:
@@ -670,13 +872,19 @@ def do_uninstall(a, home):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--role", choices=ROLES, help=f"default: the role already installed, else {ROLES[0]}")
+    p.add_argument("--agent", choices=AGENTS, default="claude",
+                   help="the agent to install the kit into: claude (the default: ~/.claude/CLAUDE.md and settings.json) or "
+                        "codex (~/.codex/AGENTS.md and hooks.json; Codex lets a command through when a hook itself fails or "
+                        "times out, where Claude Code blocks it). --uninstall takes the kit out of both")
     p.add_argument("--dry-run", action="store_true", help="print the diff, write nothing")
     p.add_argument("--yes", action="store_true", help="the person's yes, when no terminal can ask for it")
     p.add_argument("--uninstall", action="store_true")
     p.add_argument("--home", help="the home to install into (default: yours)")
     p.add_argument("--client", help="the client's name, one word")
     p.add_argument("--login", help="your GitHub login, written as the client file's « author »")
-    p.add_argument("--repo", action="append", default=[], metavar="NAME=PATH[,github=OWNER/REPO][,base=B][,build=CMD]")
+    p.add_argument("--repo", action="append", default=[], metavar="NAME=PATH[,github=OWNER/REPO][,base=B][,build=CMD]",
+                   help="a repository the kit's tools build and gate. CMD may contain commas (`mvn -pl core,web verify`); only a "
+                        "later github=, base=, build= or protected= ends it (a command holding one of those: use --client-file)")
     p.add_argument("--client-file", help="an existing project.json to install as the client file")
     p.add_argument("--context", help="your client's own context file: one @import line for it is added")
     a = p.parse_args(argv)
@@ -686,6 +894,8 @@ def main(argv=None):
         if not os.path.isfile(a.context):
             sys.exit(f"install.py: --context {a.context}: no such file")
     if a.uninstall:
+        if a.agent != "claude":
+            p.error("--uninstall takes the kit out of both agents: leave --agent out")
         return do_uninstall(a, home)
     return do_install(a, home, HERE)
 

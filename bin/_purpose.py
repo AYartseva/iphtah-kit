@@ -1,5 +1,14 @@
 ""
+import json
 import os
+
+FIRST_CATCH = 13
+
+
+def numbered_catches(catches):
+    ""
+    return [f"{FIRST_CATCH + i}. {c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)}"
+            for i, c in enumerate(catches or ())]
 
 PLACEHOLDER = "PURPOSE MISSING: what is it for, what must it stop, what must it never block?"
 TEMPLATE = """# Purpose of this lot (the session fills it before the first agent starts)

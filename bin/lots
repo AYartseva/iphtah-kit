@@ -4,11 +4,14 @@
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
+import stat
 import statistics
 import sys
+import tempfile
 from zoneinfo import ZoneInfo
 
 TAXONOMY = {
@@ -156,9 +159,17 @@ def warn_rows(notes, cap=NOTE_CAP):
 
 
 def agent_files(project):
+    ""
     out = {}
     for f in glob.glob(os.path.join(os.path.expanduser(project), "*", "subagents", "agent-*.jsonl")):
-        out[os.path.basename(f)[len("agent-"):-len(".jsonl")]] = f
+        out.setdefault(os.path.basename(f)[len("agent-"):-len(".jsonl")], []).append(f)
+    for a, fs in out.items():
+        def written(f):
+            try:
+                return (os.stat(f).st_mtime_ns, f)
+            except OSError:
+                return (0, f)
+        out[a] = sorted(fs, key=written)
     return out
 
 
@@ -178,6 +189,9 @@ def text_of(content):
     return "\n".join(x.get("text", "") for x in content or [] if isinstance(x, dict) and x.get("type") == "text")
 
 
+TITLES = re.compile(r"^[#*\s]*(?:what i )?(?:checked|evidence|verified)(?: so far)?[*\s:]*$", re.I)
+
+
 def count_findings(report):
     ""
     n, sect, bullets, inline = 0, False, 0, 0
@@ -188,19 +202,230 @@ def count_findings(report):
         t = line.strip()
         if not t:
             continue
-        if not BULLET.match(line) and len(t) < 160 and (t[0] in "#*" or t.endswith(":") or re.match(
-                r"(blockers?|should[- ]?fix|nits?|findings?|summary|verdict)\b", t, re.I)):
+        if not BULLET.match(line) and TITLES.match(t):
+            n += close() if sect else 0
+            sect, bullets, inline = False, 0, 0
+        elif not BULLET.match(line) and len(t) < 160 and (t[0] in "#*" or t.endswith(":") or re.match(
+                r"(blockers?|blocking|should[- ]?fix|nits?|findings?|summary|verdict)\b", t, re.I)):
             n += close() if sect else 0
             low = t.lower()
-            sect = ("blocker" in low or "should-fix" in low or "should fix" in low or "shouldfix" in low) \
-                and "nit" not in low
+            sect = ("blocker" in low or low.lstrip("#* ").startswith("blocking") or "should-fix" in low
+                    or "should fix" in low or "shouldfix" in low) and "nit" not in low
             bullets = 0
             rest = re.sub(r"^[#*\s]*[^:]*?[:*]*\s*:\s*", "", t) if ":" in t else ""
             rest = rest.strip(" *._-").lower()
-            inline = 1 if sect and rest and not re.match(r"(none|no\b|nothing|0\b|n/a|—|aucun)", rest) else 0
+            inline = 1 if sect and rest and not re.match(r"(none|no\b|nothing|0\b|n/a|\u2014|aucun)", rest) else 0
         elif sect and BULLET.match(line) and not re.match(r"^\W*(none|no\b|nothing|aucun)", BULLET.sub("", line).lower()):
             bullets += 1
     return n + (close() if sect else 0)
+
+
+LOT_TAG = re.compile(r"(?:^|\s)LOT:\s*(\S+)")
+LOT_START = re.compile(r"\A\s*LOT:\s*(\S+)")
+VERDICT_LINE = re.compile(r"verdict\s*:\s*(clean|findings)\.?", re.I)
+CONTINUED = "The coordinator sent a message while you were working:"
+
+
+LOT_ID_TAIL = ".,;:!?"
+
+
+def clean_lot_id(raw):
+    ""
+    raw = (raw or "").rstrip(LOT_ID_TAIL)
+    return raw or None
+
+
+def lot_tag(text):
+    ""
+    m = LOT_TAG.search(text or "")
+    return clean_lot_id(m.group(1)) if m else None
+
+
+BRIEF_PATH = re.compile(r"\bbrief\b[^\n/~]{0,60}?((?:/|~/)[^\s\"'`<>()\[\]]+)", re.I)
+BRIEF_POINTER_WINDOW = 300
+BRIEF_FILE_FIRST = re.compile(r"\ufeff?LOT:[ \t]*([A-Za-z0-9][\w.\-]*)")
+BRIEF_HEAD_BYTES = 512
+SKELETON_MARK = "# Brief skeleton ("
+SKELETON_HEAD_BYTES = 4096
+OPENING_LOT = re.compile(r"(?:Lot|LOT|You build lot)[ \t]+([A-Za-z0-9][\w.\-]*)")
+BRIEF_FILE_TITLE = re.compile(r"\ufeff?#[ \t]*Lot[ \t]+([A-Za-z0-9][\w.\-]*)")
+
+
+def brief_path(text):
+    ""
+    text = (text or "").strip()
+    m = BRIEF_PATH.search(text)
+    return m.group(1).rstrip(".,;:!?\u2014\u2013") if m and m.start() < BRIEF_POINTER_WINDOW else None
+
+
+def _brief_head(path, size):
+    ""
+    try:
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path) or not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        with open(path, "rb") as fh:
+            return fh.read(size).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def first_line(head):
+    ""
+    return next((x.rstrip("\r") for x in head.split("\n") if x.strip()), "")
+
+
+def skeleton_lot(head):
+    ""
+    lines = [x.rstrip("\r") for x in head.lstrip("﻿").split("\n")]
+    if not lines[0].startswith(("launch-lot:", "# launch-lot:")):
+        return None
+    for i, x in enumerate(lines):
+        if x.startswith(SKELETON_MARK):
+            after = next((y for y in lines[i + 1:] if y.strip()), "")
+            m = BRIEF_FILE_FIRST.match(after)
+            return clean_lot_id(m.group(1)) if m else None
+        if not x.startswith(("launch-lot:", "# ")):
+            return None
+    return None
+
+
+def brief_file_lot(path):
+    ""
+    head = _brief_head(path, SKELETON_HEAD_BYTES)
+    if head is None:
+        return None
+    m = BRIEF_FILE_FIRST.match(first_line(head[:BRIEF_HEAD_BYTES]))
+    return clean_lot_id(m.group(1)) if m else skeleton_lot(head)
+
+
+def brief_file_title(path):
+    ""
+    head = _brief_head(path, BRIEF_HEAD_BYTES)
+    m = BRIEF_FILE_TITLE.match(first_line(head)) if head else None
+    return clean_lot_id(m.group(1)) if m else None
+
+
+def opening_lot(text):
+    ""
+    m = OPENING_LOT.match((text or "").strip().split("\n", 1)[0])
+    return clean_lot_id(m.group(1)) if m else None
+
+
+BUILDER_TYPES = ("builder", "builder-high", "money-rights-builder")
+
+
+def agent_type(paths):
+    ""
+    for f in paths:
+        try:
+            with open(f[:-len(".jsonl")] + ".meta.json") as fh:
+                return json.load(fh).get("agentType")
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def attribute_by_brief_file(st, paths):
+    ""
+    if st.get("lot") or not st.get("brief_file"):
+        return st
+    lot = brief_file_lot(st["brief_file"])
+    if not lot:
+        st["file_hint"] = brief_file_title(st["brief_file"])
+        return st
+    st["lot"] = lot
+    st["is_review"] = agent_type(paths) == "fresh-eyes-reviewer"
+    st["findings"] = st.get("findings_any") if st["is_review"] else None
+    return st
+
+
+def resolve_opening_lots(stats, ledger_lots):
+    ""
+    listed = {a for lot in ledger_lots.values() if isinstance(lot, dict) for a in (lot.get("agents") or [])}
+    done = []
+    for a, st in stats.items():
+        if st.get("lot") or a in listed:
+            continue
+        hints = {h for h in (st.get("lot_hint"), st.get("file_hint")) if h}
+        if len(hints) != 1:
+            continue
+        lot = hints.pop()
+        if lot not in ledger_lots:
+            continue
+        st["lot"] = lot
+        st["is_review"] = bool(st.get("review_words"))
+        st["findings"] = st.get("findings_any") if st["is_review"] else None
+        done.append(a)
+    return done
+
+
+def pass_lot(text):
+    ""
+    text = text or ""
+    if text.startswith(CONTINUED):
+        text = text[len(CONTINUED):]
+    m = LOT_START.match(text)
+    return clean_lot_id(m.group(1)) if m else None
+
+
+def starts_pass(text, first):
+    ""
+    return first or text.startswith(CONTINUED) or bool(LOT_START.match(text))
+
+
+def verdict_of(report):
+    ""
+    last = next((l.strip(" *_`>") for l in reversed((report or "").splitlines()) if l.strip()), "")
+    m = VERDICT_LINE.fullmatch(last)
+    return m.group(1).lower() if m else None
+
+
+def records(paths):
+    ""
+    paths = [paths] if isinstance(paths, str) else list(paths)
+    seen = set()
+    for path in paths:
+        mine = set()
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                u = d.get("uuid")
+                if len(paths) > 1 and isinstance(u, str) and u:
+                    if u in seen:
+                        continue
+                    mine.add(u)
+                yield d
+        seen |= mine
+
+
+def review_passes(path, lot=None):
+    ""
+    passes, cur = [], None
+    for d in records(path):
+        m = d.get("message") or {}
+        if d.get("type") == "user" and cur is None:
+            text = text_of(m.get("content")).strip()
+            if text and starts_pass(text, not passes):
+                lot = pass_lot(text) or lot
+                cur = {"message": text, "lot": lot, "report": None, "verdict": None, "at": d.get("timestamp")}
+        elif d.get("type") == "assistant" and cur is not None and isinstance(m.get("content"), list):
+            for x in m["content"]:
+                if isinstance(x, dict) and x.get("type") == "tool_use" and x.get("name") == "SubagentHandback":
+                    report = (x.get("input") or {}).get("message")
+                    if isinstance(report, str) and report.strip():
+                        cur.update(report=report, verdict=verdict_of(report), at=d.get("timestamp") or cur["at"])
+                        passes.append(cur)
+                        cur = None
+                        break
+    if cur is not None:
+        passes.append(cur)
+    return passes
 
 
 def session_files(project):
@@ -209,7 +434,97 @@ def session_files(project):
             for f in glob.glob(os.path.join(os.path.expanduser(project), "*.jsonl"))}
 
 
+STATS_CACHE = "~/.local/state/iphtah-kit/cache/agent-stats.json"
+_STATS = {"entries": None, "dirty": False}
+
+
+def _stats_fingerprint():
+    if "src" not in _STATS:
+        with open(os.path.realpath(__file__), "rb") as f:
+            _STATS["src"] = f.read()
+    h = hashlib.sha256()
+    h.update(_STATS["src"])
+    h.update(json.dumps([WEIGHTS, PRICE_KEYS, IDLE_GAP_S, LONG_TEXT], sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _stats_entries():
+    if _STATS["entries"] is None:
+        try:
+            with open(os.path.expanduser(STATS_CACHE)) as f:
+                e = json.load(f).get("entries")
+            _STATS["entries"] = {k: v for k, v in e.items() if isinstance(v, dict) and isinstance(v.get("path"), str)} \
+                if isinstance(e, dict) else {}
+        except (OSError, ValueError, AttributeError):
+            _STATS["entries"] = {}
+    return _STATS["entries"]
+
+
+def flush_stats_cache():
+    ""
+    if not _STATS["dirty"]:
+        return
+    path = os.path.expanduser(STATS_CACHE)
+    tmp = None
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        keep = {k: v for k, v in _STATS["entries"].items()
+                if all(os.path.exists(x) for x in (v.get("paths") if isinstance(v.get("paths"), list) else [v.get("path", "")]))}
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="agent-stats.", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"entries": keep}, f)
+        os.replace(tmp, path)
+        tmp = None
+        _STATS["dirty"] = False
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _price_hash(models):
+    ""
+    return hashlib.sha256(json.dumps({k: PRICES.get(k) for k in sorted({*models, ""})}, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def agent_stats(path, since=None, until=None, main=False):
+    ""
+    paths = [path] if isinstance(path, str) else list(path)
+    try:
+        sigs = [[os.stat(x).st_size, os.stat(x).st_mtime_ns] for x in paths]
+    except OSError:
+        return parse_agent_stats(path, since, until, main)
+    sig = sigs[0] if len(paths) == 1 else sigs
+    key = json.dumps([os.path.abspath(paths[0]) if len(paths) == 1 else [os.path.abspath(x) for x in paths],
+                      since, until, bool(main)])
+    fp = _stats_fingerprint()
+    hit = _stats_entries().get(key)
+    if not (isinstance(hit, dict) and hit.get("sig") == sig and hit.get("fp") == fp
+            and isinstance(hit.get("variants"), dict) and isinstance(hit.get("models"), list)):
+        hit = None
+    if hit:
+        got = hit["variants"].get(_price_hash(hit["models"]))
+        if isinstance(got, dict):
+            out = dict(got)
+            out["minutes"] = set(out.get("minutes") or [])
+            return out
+    out = parse_agent_stats(path, since, until, main)
+    models = list(out["model_msgs"])
+    if not hit:
+        hit = _stats_entries()[key] = {"path": os.path.abspath(paths[0]), "paths": [os.path.abspath(x) for x in paths],
+                                       "sig": sig, "fp": fp, "models": models, "variants": {}}
+    if sorted(hit["models"]) != sorted(models):
+        hit.update(models=models, variants={})
+    hit["variants"][_price_hash(models)] = dict(out, minutes=sorted(out["minutes"]))
+    _STATS["dirty"] = True
+    return out
+
+
+def parse_agent_stats(path, since=None, until=None, main=False):
     ""
     since, until = (ts(since) if since else None), (ts(until) if until else None)
     wtok, usd, stamps, model, lot = 0.0, 0.0, [], None, None
@@ -217,11 +532,7 @@ def agent_stats(path, since=None, until=None, main=False):
     nmsg = {}
     seen = set()
     neff = {}
-    for line in open(path, encoding="utf-8"):
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
+    for d in records(path):
         if main and d.get("isSidechain"):
             continue
         if since or until:
@@ -243,11 +554,7 @@ def agent_stats(path, since=None, until=None, main=False):
                 elif x.get("type") == "text" and len(x.get("text", "")) >= LONG_TEXT:
                     last_text = x["text"]
         if lot is None and m.get("role") == "user" and isinstance(m.get("content"), str):
-            for tok in m["content"].split():
-                if tok.startswith("LOT:"):
-                    lot = tok[4:] or None
-            if "LOT: " in m["content"]:
-                lot = m["content"].split("LOT: ", 1)[1].split()[0]
+            lot = lot_tag(m["content"])
         u = m.get("usage")
         key = (m.get("id"), d.get("requestId"))
         if isinstance(u, dict) and key != (None, None):
@@ -267,8 +574,11 @@ def agent_stats(path, since=None, until=None, main=False):
                 usd += sum((u.get(k) or 0) * price.get(pk, 0) for k, pk in PRICE_KEYS.items()) / 1e6
     if lot is None and brief:
         mm = re.search(r"^\s*LOT:\s*(\S+)", brief, re.M)
-        lot = mm.group(1) if mm else None
-    is_review = bool(brief and lot and REVIEW_BRIEF.search(brief[:300]))
+        lot = clean_lot_id(mm.group(1)) if mm else None
+    review_words = bool(brief and REVIEW_BRIEF.search(brief[:300]))
+    is_review = bool(lot and review_words)
+    brief_file = brief_path(brief) if lot is None and not main else None
+    lot_hint = opening_lot(brief) if lot is None and not main else None
     stamps.sort()
     active = sum(g for g in ((b - a).total_seconds() for a, b in zip(stamps, stamps[1:])) if g <= IDLE_GAP_S)
     minutes = set()
@@ -276,14 +586,62 @@ def agent_stats(path, since=None, until=None, main=False):
         if (b - a).total_seconds() <= IDLE_GAP_S:
             minutes.update(range(int(a.timestamp()) // 60, int(b.timestamp()) // 60 + 1))
     return {"is_review": is_review, "findings": count_findings(handback or last_text) if is_review else None,
+            "brief_file": brief_file, "lot_hint": lot_hint, "review_words": review_words,
+            "findings_any": count_findings(handback or last_text) if not main else None,
             "wtok": wtok, "usd": usd, "active_s": active, "model": model, "model_msgs": nmsg, "effort_msgs": neff, "lot": lot, "minutes": minutes,
             "first": stamps[0].isoformat() if stamps else None,
             "last": stamps[-1].isoformat() if stamps else None}
 
 
-def actuals(d, project):
+def attributed_stats(d, project):
+    ""
     files = agent_files(project)
-    stats = {a: agent_stats(f) for a, f in files.items()}
+    stats = {a: attribute_by_brief_file(agent_stats(f), f) for a, f in files.items()}
+    opened = set(resolve_opening_lots(stats, d["lots"]))
+    for a, st in stats.items():
+        kind = agent_type(files[a]) if st.get("lot") else None
+        if kind in BUILDER_TYPES or kind == "fresh-eyes-reviewer":
+            st["is_review"] = kind == "fresh-eyes-reviewer"
+            st["findings"] = st.get("findings_any") if st["is_review"] else None
+    return files, stats, opened
+
+
+def lot_agent_counts(d, project, lid):
+    ""
+    files, stats, _ = attributed_stats(d, project)
+    lot = d["lots"].get(lid) if isinstance(d["lots"].get(lid), dict) else {}
+    mine = [stats[a] for a in set(lot.get("agents") or []) | {a for a, s in stats.items() if s["lot"] == lid} if a in stats]
+    flush_stats_cache()
+    return sum(1 for s in mine if not s["is_review"]), sum(1 for s in mine if s["is_review"])
+
+
+def builder_waiver(row):
+    ""
+    ws = row.get("waivers") if isinstance(row, dict) else None
+    whys = [w.get("why") for w in ws if isinstance(w, dict) and w.get("kind") == "no-builder"] if isinstance(ws, list) else []
+    whys = [" ".join(w.split()) for w in whys if isinstance(w, str) and re.search(r"[^\W\d_]{2,}", w)]
+    return whys[-1][:300] if whys else None
+
+
+def builder_gap(lid, row, builders, reviewers):
+    ""
+    if builders:
+        return None
+    why = builder_waiver(row)
+    if why:
+        return f"no builder agent counted (waived: {why})"
+    head = f"reviewers but no builder counted ({reviewers} review agent(s), 0 builder)" if reviewers \
+        else "no builder counted (no agent at all)"
+    return (f"{head}: its hours would read as cheap. Put « LOT: {lid} » as the FIRST line of the builder's prompt or "
+            f"brief file, or attach it: lots agents {lid} <agent id>; a lot the session built itself: "
+            f"lots waive {lid} --no-builder \"<why>\"")
+
+
+def actuals(d, project, redo=()):
+    ""
+    files, stats, opened = attributed_stats(d, project)
+    passes = {a: review_passes(f, stats[a]["lot"] if stats[a].get("brief_file") or a in opened else None)
+              if stats[a]["is_review"] else [] for a, f in files.items()}
     sfiles = session_files(project)
     busy = {}
     for st in stats.values():
@@ -291,7 +649,7 @@ def actuals(d, project):
             busy[m] = busy.get(m, 0) + 1
     res = {}
     for lid, lot in d["lots"].items():
-        if lot.get("actuals"):
+        if lot.get("actuals") and lid not in redo:
             res[lid] = lot["actuals"]
             continue
         ids = set(lot.get("agents", [])) | {a for a, s in stats.items() if s["lot"] == lid}
@@ -310,6 +668,12 @@ def actuals(d, project):
         models = {}
         builders = [s for s in mine if not s["is_review"]] or mine
         reviews = sorted((s for s in mine if s["is_review"]), key=lambda s: s["first"] or "")
+        rounds = sorted((p for a in files if stats[a]["is_review"] for p in passes[a]
+                         if p["lot"] == lid and p["report"]), key=lambda p: p["at"] or "")
+        if rounds:
+            found = [count_findings(p["report"]) for p in rounds]
+        else:
+            found = [s["findings"] for s in reviews]
         for s in builders:
             tot = sum(s["model_msgs"].values()) or 1
             for m, n in s["model_msgs"].items():
@@ -324,15 +688,93 @@ def actuals(d, project):
         res[lid] = {"models": models, "main_model": max(models, key=models.get) if models else None,
                     "efforts": efforts, "main_effort": max(efforts, key=efforts.get) if efforts else None,
                     "agents": len(mine), "build_agents": len([s for s in mine if not s["is_review"]]),
-                    "review_rounds": len(reviews) or None,
-                    "findings": sum(s["findings"] for s in reviews) if reviews else None,
-                    "first_pass_clean": (reviews[0]["findings"] == 0) if reviews else None, "wtok": round(sum(s["wtok"] for s in mine)), "concurrency": conc,
+                    "review_rounds": len(found) or None,
+                    "findings": sum(found) if found else None,
+                    "first_pass_clean": (found[0] == 0) if found else None, "wtok": round(sum(s["wtok"] for s in mine)), "concurrency": conc,
                     "usd": round(sum(s["usd"] for s in mine), 2),
                     "agent_h": round(sum(s["active_s"] for s in mine) / 3600, 2),
                     "elapsed_h": round((max(lasts) - min(firsts)).total_seconds() / 3600, 1),
                     "missing_agents": sorted(set(lot.get("agents", [])) - set(files)),
                     "missing_sessions": sorted({x["id"] for x in lot.get("sessions", [])} - set(sfiles)) or None}
+    flush_stats_cache()
     return res
+
+
+REFREEZE_SINCE = "2026-10-27T00:00:00+01:00"
+REFROZEN_KEYS = ("agent_h", "usd", "agents", "build_agents", "wtok")
+
+
+def refreeze_plan(d, project, since):
+    ""
+    cutoff = ts(since)
+    redo = []
+    for lid, lot in d["lots"].items():
+        began = start_of(lid, lot, []) if isinstance(lot, dict) else None
+        if is_closed(lot) and isinstance(lot.get("actuals"), dict) and lot["actuals"] and began and began >= cutoff:
+            redo.append(lid)
+    fresh = actuals(d, project, redo=set(redo))
+    plan, refused = [], []
+    for lid in redo:
+        old, new = d["lots"][lid]["actuals"], fresh.get(lid)
+        if not new:
+            refused.append({"lot": lid, "old": old, "new": {"agent_h": 0, "usd": 0, "agents": 0}})
+            continue
+        if all(old.get(k) == new.get(k) for k in REFROZEN_KEYS):
+            continue
+        if new["agent_h"] < (old.get("agent_h") or 0) or new["usd"] < (old.get("usd") or 0):
+            refused.append({"lot": lid, "old": old, "new": new})
+            continue
+        plan.append({"lot": lid, "old": old, "new": new})
+    return plan, refused
+
+
+def refreeze_apply(d, plan, now):
+    ""
+    written, skipped = [], []
+    for item in plan:
+        lot = d["lots"].get(item["lot"])
+        if not isinstance(lot, dict) or not item["old"] or lot.get("actuals") != item["old"]:
+            skipped.append(item["lot"])
+            continue
+        before = item["old"].get("refrozen")
+        was = before["was"] if isinstance(before, dict) and isinstance(before.get("was"), dict) \
+            else {k: item["old"].get(k) for k in REFROZEN_KEYS + ("frozen_at",)}
+        lot["actuals"] = dict(item["new"], frozen_at=now, refrozen={"at": now, "was": was})
+        written.append(item["lot"])
+    return written, skipped
+
+
+def refreeze_main(a):
+    ""
+    d = load_checked(a.client, "refreeze")
+    fj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/flow.json")
+    if os.path.exists(fj):
+        PRICES.update(json.load(open(fj)).get("token_prices_per_mtok") or {})
+    since = stamped("refreeze", "--since", a.since)
+    plan, refused = refreeze_plan(d, a.project, since)
+    print(f"{'lot':<40} {'agent_h old':>11} {'new':>7} {'usd old':>9} {'new':>8} {'agents old':>10} {'new':>4}")
+    for it in plan + refused:
+        o, n = it["old"], it["new"]
+        print(f"{it['lot'][:40]:<40} {o.get('agent_h', '-')!s:>11} {n['agent_h']:>7} {o.get('usd', '-')!s:>9} "
+              f"{n['usd']:>8} {o.get('agents', '-')!s:>10} {n['agents']:>4}" + ("   DROP: not written" if it in refused else ""))
+    for r in refused:
+        print(f"lots: refreeze: {r['lot']}: the new figures are lower than the frozen ones: not written", file=sys.stderr)
+    if not a.apply:
+        while STAMPED:
+            print(STAMPED.pop(0))
+        print(f"refreeze since {since}: {len(plan)} lot(s) would change, {len(refused)} refused; dry run, nothing written")
+        return 2 if refused else 0
+    lock = ledger_lock(a.client)
+    d = load_checked(a.client, "refreeze")
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    written, skipped = refreeze_apply(d, plan, now)
+    if written:
+        save(a.client, d)
+    while STAMPED:
+        print(STAMPED.pop(0))
+    print(f"refreeze since {since}: {len(written)} lot(s) frozen again" + (f", {len(skipped)} changed meanwhile and left "
+          f"alone ({', '.join(skipped)})" if skipped else "") + (f", {len(refused)} refused" if refused else ""))
+    return 2 if refused or skipped else 0
 
 
 def attach_session(d, lid, session, since=None, until=None):
@@ -1611,6 +2053,9 @@ def main():
     p = sub.add_parser("pooled"); p.add_argument("--class", dest="cls", choices=CLASSES)
     sub.add_parser("selftest")
     sub.add_parser("freeze")
+    p = sub.add_parser("refreeze", help="count again the actuals of the lots started since a date and freeze them again, "
+                       "with the old values noted; a dry run without --apply (m273)")
+    p.add_argument("--since", default=REFREEZE_SINCE); p.add_argument("--apply", action="store_true")
     p = sub.add_parser("cell"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
     p.add_argument("--type", help="kind/layer/domain: in an at-risk stratum, the protocol arm is chosen too")
     sub.add_parser("over")
@@ -1625,11 +2070,21 @@ def main():
     p = sub.add_parser("type"); p.add_argument("id"); p.add_argument("value", help="kind/layer/domain")
     p = sub.add_parser("reclass"); p.add_argument("id"); p.add_argument("--class", dest="cls", choices=CLASSES, required=True)
     p.add_argument("--reason", required=True)
+    p = sub.add_parser("waive", help="a written waiver: the lot's mutant-check proof cannot run (verify-lot reads it)")
+    p.add_argument("id")
+    w = p.add_mutually_exclusive_group(required=True)
+    w.add_argument("--mutant", metavar="WHY")
+    w.add_argument("--no-builder", metavar="WHY", help="the session built the lot itself: no builder agent to count (mcount)")
     a = ap.parse_args()
+    if a.cmd == "waive" and not re.search(r"[^\W\d_]{2,}", a.mutant or a.no_builder or ""):
+        sys.exit(f"waive: --{'mutant' if a.mutant is not None else 'no-builder'} needs a reason in words (what cannot "
+                 "run or who built it, and why it may ship anyway): nothing written")
     if not a.project:
         pj = os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")
         a.project = (json.load(open(pj)).get("claude_project") if os.path.exists(pj) else None) \
             or "~/.claude/projects/" + os.getcwd().replace("/", "-")
+    if a.cmd == "refreeze":
+        sys.exit(refreeze_main(a))
     sensors = None
     if a.cmd == "sweep":
         sensors = read_sensors(a.client)
@@ -1746,6 +2201,11 @@ def main():
         if froz and not lot.get("actuals"):
             lot["actuals"] = dict(froz, frozen_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
         save(a.client, d)
+        counted = lot.get("actuals") or froz or {}
+        gap = builder_gap(a.id, lot, counted.get("build_agents") or 0,
+                          (counted.get("agents") or 0) - (counted.get("build_agents") or 0))
+        if gap:
+            print(f"lots: {a.id}: {gap}")
     elif a.cmd == "freeze":
         act = actuals(d, a.project)
         n = 0
@@ -1813,6 +2273,14 @@ def main():
         d["lots"][a.id]["type"] = parse_type(a.value)
         save(a.client, d)
         print(a.id, "→", a.value)
+    elif a.cmd == "waive":
+        if a.id not in d["lots"]:
+            sys.exit(f"waive: no lot {a.id} in the ledger: nothing written")
+        kind, why = ("mutant", a.mutant) if a.mutant is not None else ("no-builder", a.no_builder)
+        d["lots"][a.id].setdefault("waivers", []).append(
+            {"kind": kind, "why": why.strip(), "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+        save(a.client, d)
+        print(f"{a.id}: {'mutant-check' if kind == 'mutant' else 'no builder'} waived: {why.strip()}")
     elif a.cmd == "reclass":
         lot = d["lots"][a.id]
         lot.setdefault("reclassed", []).append({"from": lot.get("class"), "to": a.cls, "reason": a.reason,

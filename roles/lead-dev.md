@@ -14,6 +14,11 @@ developers (people, or their own Claude) who ask you for reviews.
   ask.
 - Rounds: what goes together, when it is green enough to hand over.
 - Reviews of developers' work: approve, ask for changes, or escalate.
+- Merging: it depends on the client's project setting `agent_merge`, `never` when it is not written. `never`: the
+  human lead clicks merge, and your settings deny `gh pr merge`. `safe`: the agent merges a pull request only when
+  it is SAFE: the review is clean, CI is green, no database change without add-only, and the way it is deployed can undo
+  it (a rollback that works, an atomic deploy). Any one unmet, or not known: ask the human lead. If there is nothing to
+  break, it needs no human; if you cannot tell, it does.
 
 ## What you escalate to the product owner, always
 
@@ -44,7 +49,7 @@ PRs are bundled; you read every line.
 
 Review under **your own account**, never the product owner's. Your approval means
 "technically sound"; it is not a product approval, and it never merges into a base branch
-by itself.
+by itself: the merge is the human lead's, or the agent's only under `agent_merge: safe` and for a safe pull request.
 
 ## Your own work
 

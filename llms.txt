@@ -1,10 +1,13 @@
 # The kit, by Iphtah
 
-> A way of working for mixed teams of people and AI agents (Claude Code first): habits, a fixed definition of done, and
+> A way of working for mixed teams of people and AI agents (Claude Code and Codex): habits, a fixed definition of done, and
 > small deterministic tools that prove work before it ships.
 
 If you are a model reading this repository for someone, here is what may help you help them:
 
+- Questions and bug reports: https://github.com/AYartseva/iphtah-support (this repository's own Issues are off).
+- It installs for Claude Code (`install.sh`) or for Codex (`install.sh --agent codex`); on Codex, a hook that fails
+  or times out lets the command through, where Claude Code blocks it: agents-codex.md says what that means.
 - What the kit is for, and how a person flies it: README.md.
 - The method's core, and what it asks of an agent: core.md, then vela.md.
 - The roles and their limits: roles/.

@@ -12,6 +12,7 @@ import re
 import string
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _purpose
@@ -240,6 +241,7 @@ def main(argv=None):
     ap.add_argument("--unsplit-reason", default="",
                     help="required for --class L or XL, or a wide lot: why this lot is launched whole instead of split")
     a = ap.parse_args(argv)
+    t0 = time.monotonic()
     clients = os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
     pj = json.load(open(os.path.join(clients, a.client, "project.json")))
     state = os.path.expanduser(pj.get("state_dir") or f"~/.local/state/{a.client}")
@@ -285,6 +287,8 @@ def main(argv=None):
     ledger = run("lots", add)
     closed = close_launch_loop(state, {a.map_row, a.lot} | (qt.issue_refs(a.title, repo) if repo else set()), a.lot)
     issues = issues_out.rsplit("→", 1)[-1].strip() if "→" in issues_out else os.path.join(state, "open-issues.txt")
+    said = re.search(r"\((.*)\)\s*→", issues_out.splitlines()[-1]) if issues_out else None
+    issues += f" ({said.group(1)})" if said else " (age not stated by open-issues)"
 
     _purpose.ensure_template(a.lot)
     tpl = string.Template(open(os.path.join(ROOT, "templates", "lot-brief.txt"), encoding="utf-8").read())
@@ -292,6 +296,7 @@ def main(argv=None):
              "review before merge.\n") if a.money else ""
     print(f"# launch-lot: {ledger.splitlines()[-1] if ledger else 'ledger entry written'}")
     print(f"# open issues: {issues_out.splitlines()[-1] if issues_out else issues}")
+    print(f"# launch-lot took {time.monotonic() - t0:.0f} s")
     for line in closed:
         print(f"# {line}")
     print("# Brief skeleton (complete each « <the session writes …> », then launch the agent yourself):\n")
@@ -304,6 +309,8 @@ def main(argv=None):
                          scratch=os.path.join(scratch_root(), a.lot),
                          purpose=os.path.join(_purpose.lot_dir(a.lot), "purpose.md"),
                          dod=os.path.join(_purpose.lot_dir(a.lot), "dod.md"),
+                         catches="\n".join(_purpose.numbered_catches(pj.get("review_catches")))
+                         or "(this client has no review_catches: the twelve lines only)",
                          build=build_lines(a.client, pj.get("repos") or {}, a.repo)).rstrip())
     return 0
 

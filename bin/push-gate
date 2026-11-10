@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""push-gate — Claude Code PreToolUse hook (Bash): no push of an unverified commit.
+"""push-gate — Claude Code PreToolUse hook (Bash, and Monitor): no push of an unverified commit.
 """
 import json
 import os
@@ -270,7 +270,7 @@ def done_refusal(name, state_dir, sha, branch, bypass, floor=True):
 
 def main():
     data = json.load(sys.stdin)
-    command = (data.get("tool_input") or {}).get("command", "")
+    command = (data.get("tool_input") or {}).get("command") or ""
     if "push" not in command or "git" not in command:
         sys.exit(0)
     found = pushes(command, data.get("cwd") or os.getcwd())

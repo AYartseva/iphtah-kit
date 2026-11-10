@@ -30,13 +30,16 @@ def line(repo, issue):
 
 
 UNREACHABLE = "(UNREACHABLE:"
+GH_TIMEOUT_S = 60
 ISSUE_LINE = re.compile(r"^\S+#\d+  ")
 
 
 def fetch(repo):
     try:
         r = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
-                            "--json", "number,title,labels"], capture_output=True, text=True)
+                            "--json", "number,title,labels"], capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return [f"{repo}  (UNREACHABLE: gh gave no answer in {GH_TIMEOUT_S} s)"]
     except FileNotFoundError:
         sys.exit("open-issues: gh (the GitHub command line) is not installed or not on the PATH, so the open issues "
                  "cannot be listed; install it and run `gh auth login`")
@@ -60,7 +63,8 @@ def main(argv=None):
     state = os.path.expanduser(pj.get("state_dir") or f"~/.local/state/{client}")
     out = a[a.index("--out") + 1] if "--out" in a else os.path.join(state, "open-issues.txt")
     max_age = float(a[a.index("--max-age") + 1]) if "--max-age" in a else 30
-    if not (os.path.exists(out) and time.time() - os.path.getmtime(out) < max_age * 60 and not unreachable(out)):
+    cached = os.path.exists(out) and time.time() - os.path.getmtime(out) < max_age * 60 and not unreachable(out)
+    if not cached:
         lines = []
         for repo in repos_of(pj):
             lines += fetch(repo)
@@ -72,8 +76,9 @@ def main(argv=None):
         os.replace(out + ".tmp", out)
     n = sum(1 for l in open(out) if ISSUE_LINE.match(l))
     lost = unreachable(out)
-    print(f"{n} open issues → {out}" + (f" (WARNING: {lost} repository(ies) unreachable, listed as such; "
-                                          "not reused from the cache)" if lost else ""))
+    age = f"from cache, {int((time.time() - os.path.getmtime(out)) // 60)} min old" if cached else "refreshed just now"
+    warn = f"; WARNING: {lost} repository(ies) unreachable, listed as such; not reused from the cache" if lost else ""
+    print(f"{n} open issues ({age}{warn}) → {out}")
 
 
 if __name__ == "__main__":

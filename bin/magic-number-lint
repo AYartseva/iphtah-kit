@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""magic-number-lint <repo> [--base REF] [--head REF] [--client C]
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+_ML = SourceFileLoader("migration_lint", os.path.join(HERE, "migration-lint")).load_module()
+
+MAX_FILE_BYTES = 1_048_576
+MAX_LINE_CHARS = 4000
+
+EXT = {".py": "py", ".sh": "sh", ".bash": "sh", ".java": "c", ".kt": "c", ".kts": "c", ".ts": "c", ".tsx": "c",
+       ".js": "c", ".jsx": "c", ".mjs": "c", ".cjs": "c"}
+TEST_PATHS = {
+    "a tests/, test/, __tests__/, fixtures/ or androidTest/ directory": r"(^|/)(tests?|__tests__|fixtures|androidTest)/",
+    "src/test/": r"(^|/)src/test/",
+    "test_*.py and *_test.py": r"(^|/)test_[^/]*\.py$|_test\.py$",
+    "conftest.py": r"(^|/)conftest\.py$",
+    "*Test.java, *Tests.java, *Test.kt, *Tests.kt": r"Tests?\.(java|kt)$",
+    "*.test.ts and *.spec.ts (and tsx, js, jsx)": r"\.(test|spec)\.[jt]sx?$",
+}
+TEST_PATH = re.compile("|".join(TEST_PATHS.values()))
+LIMIT_WORDS = {"max", "maximum", "min", "minimum", "limit", "limits", "bytes", "size", "timeout", "timeouts", "ttl",
+               "retries", "retry", "attempts", "per_page", "perpage", "pagesize", "threshold", "temperature", "top_p", "topp",
+               "top_k", "topk", "delay", "interval", "backoff", "cap", "quota", "expiry", "expires", "expires_in",
+               "window", "deadline", "poll", "debounce"}
+CONSTANT_ONLY = {"page", "batch"}
+UI_KEYS = {"fontSize", "lineHeight", "letterSpacing", "zIndex", "width", "height", "minWidth", "maxWidth",
+           "minHeight", "maxHeight", "borderRadius", "gap", "opacity"}
+UI_PREFIXES = ("padding", "margin", "flex")
+UI_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+UNIT_WORDS = {"ms", "millis", "milliseconds", "sec", "secs", "seconds", "s", "mins", "minutes", "hours", "hrs",
+              "days", "kb", "mb", "gb", "kib", "mib"}
+__doc__ = (__doc__.replace("@LIMIT_WORDS@", ", ".join(sorted(LIMIT_WORDS)))
+           .replace("@UNITS@", ", ".join(sorted(UNIT_WORDS))).replace("@TESTS@", "; ".join(TEST_PATHS))
+           .replace("@CONSTANTS@", ", ".join(sorted(CONSTANT_ONLY)))
+           .replace("@UI@", ", ".join(sorted(UI_KEYS)) + ", " + ", ".join(p + "*" for p in UI_PREFIXES)))
+NUM = (r"(?<![\w.])-?(?:0[xX][0-9a-fA-F_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)[lLfFdD]?(?![\w.])")
+IDENT = r"[A-Za-z_$][\w$]*"
+ASSIGN = re.compile(rf"(?<![\w$])(?P<id>{IDENT})\s*(?::\s*[A-Za-z_][\w.\[\]<>?|]*)?\s*(?::|=(?!=))(?P<rhs>.*)")
+LEADING = re.compile(rf"^[\s(]*(?:[\w.]+\s*\(\s*)*(?P<num>{NUM})")
+FALLBACK = re.compile(rf"(?:\bor\b|\?\?|\|\||:-)\s*(?P<num>{NUM})")
+CALLED = re.compile(rf"(?P<id>{IDENT})\s*\(\s*(?P<num>{NUM})")
+COMPARED = re.compile(rf"(?P<id>{IDENT})(?:\(\))?\s*(?:<=|>=|<|>)\s*(?P<num>{NUM})|(?P<num2>{NUM})\s*(?:<=|>=|<|>)\s*(?P<id2>{IDENT})")
+DURATION = re.compile(r"(?:\bDuration\.of\w+|\btimedelta|\bsetTimeout|\bsetInterval|\bsleep|\.plus\w*|\.minus\w*|"
+                      r"\bPageRequest\.of|\.timeout|\bwait_for)\s*\(")
+CLOSES_CALL = re.compile(rf"^[\s)}}\]]*[)}}\]]\s*,\s*(?P<num>{NUM})\s*\)")
+SHELL_NUM = r"(?<![\w.])\d[\d_]*(?:\.\d+)?[smhd]?(?![\w.])"
+SHELL_WAIT = re.compile(rf"(?:^|[\s;&|(])(?:sleep|timeout)\s+(?P<num>{SHELL_NUM})|--(?:max-time|timeout|retry\w*)[ =](?P<num2>{SHELL_NUM})")
+MIN_CALL = re.compile(r"\bmin\s*\(")
+MAX_METHOD = re.compile(r"(?<!Math)(?<!Integer)(?<!Long)(?<!Double)(?<!Float)(?<!Short)\.max\s*\(")
+DEFAULT_ARG = re.compile(rf"\bdefault\s*=\s*(?P<num>{NUM})")
+READ_CALL = re.compile(r"(?:\bos\.environ\.get|\bos\.getenv|\bgetenv|\bSystem\.getenv|\bSystem\.getProperty|"
+                       r"\b(?:Integer|Long|Boolean)\.get(?:Integer|Long|Boolean)|\.getProperty|"
+                       r"\b(?:cfg|config|conf|settings)(?:\.\w+)*\.get\w*|\b(?:get|read|load)_(?:setting|config)\w*|"
+                       r"\bread_setting|\bload_config)\s*\(")
+READ_ENV = re.compile(r"\bprocess\.env(?:\.\w+|\[[^\]]*\])\s*(?:\?\?|\|\|)\s*")
+READ_EXPANSION = re.compile(r"\$\{[\w.-]+:-?")
+DECISION = re.compile(r"decision\s*#?\s*\d+|DECISIONS", re.I)
+ALLOW = re.compile(r"lint:\s*allow\s+N1\b(?P<reason>.*)$", re.I)
+
+
+def git(repo, *args, check=True):
+    ""
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    if check and r.returncode != 0:
+        sys.stderr.write(f"magic-number-lint: git {' '.join(args)}: {r.stderr.decode('utf-8', 'replace').strip()}\n")
+        sys.exit(2)
+    return r.stdout.decode("utf-8", "replace")
+
+
+def words(ident):
+    ""
+    return [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", ident)]
+
+
+def is_limit_name(ident):
+    parts = words(ident)
+    return (bool(set(parts) & LIMIT_WORDS) or (ident.isupper() and bool(set(parts) & CONSTANT_ONLY))
+            or ident.lower() in LIMIT_WORDS or "_".join(parts) in LIMIT_WORDS
+            or (len(parts) >= 2 and parts[-1] in UNIT_WORDS))
+
+
+def ui_key(ident, path):
+    ""
+    return path.endswith(UI_EXT) and (ident in UI_KEYS or ident.startswith(UI_PREFIXES))
+
+
+def exempt(literal):
+    try:
+        return float(literal.replace("_", "").rstrip("lLfFdDsmh")) in (0.0, 1.0, -1.0)
+    except ValueError:
+        return False
+
+
+def scan(text, lang):
+    ""
+    code, strs, comm = [[]], [[]], [[]]
+    i, n = 0, len(text)
+    block = False
+
+    def new_line():
+        code.append([])
+        strs.append([])
+        comm.append([])
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            new_line()
+            i += 1
+            continue
+        if block:
+            if text.startswith("*/", i):
+                block = False
+                i += 2
+            else:
+                comm[-1].append(ch)
+                i += 1
+            continue
+        prev = text[i - 1] if i else "\n"
+        if lang == "c" and text.startswith("/*", i):
+            block = True
+            i += 2
+            continue
+        if (lang == "c" and text.startswith("//", i)) or (lang != "c" and ch == "#" and (prev.isspace() or prev in ";(" or i == 0)):
+            while i < n and text[i] != "\n":
+                comm[-1].append(text[i])
+                i += 1
+            continue
+        if ch in "'\"`":
+            triple = text.startswith(ch * 3, i) and (lang == "py" or (lang == "c" and ch == '"'))
+            q = ch * 3 if triple else ch
+            j = i + len(q)
+            body, exprs = [], []
+            while j < n:
+                if text[j] == "\\" and (lang != "sh" or ch == '"'):
+                    body.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text.startswith(q, j):
+                    break
+                if text[j] == "\n" and not (triple or ch == "`" or (lang == "sh" and ch == '"')):
+                    break
+                body.append(text[j])
+                j += 1
+            s = "".join(body)
+            end = j + len(q) if text.startswith(q, j) else j
+            if triple:
+                pass
+            else:
+                strs[-1].append(s)
+                rest = text[end:end + 20].lstrip(" \t")
+                if re.fullmatch(IDENT, s) and rest.startswith(":") and not rest.startswith("::"):
+                    code[-1].append(s)
+                else:
+                    code[-1].append(ch + ch)
+                    for e in re.finditer(r"\$\{[^}\n]*\}", s):
+                        exprs.append((s.count("\n", 0, e.start()), " " + e[0]))
+            first = len(code) - 1
+            for _ in range(s.count("\n")):
+                new_line()
+            for off, e in exprs:
+                code[first + off].append(e)
+            i = end
+            continue
+        code[-1].append(ch)
+        i += 1
+    return ["".join(c) for c in code], [" ".join(x) for x in strs], ["".join(c) for c in comm]
+
+
+def fallback_of_a_read(code, at):
+    ""
+    for m in READ_CALL.finditer(code):
+        args = balanced(code, m.end() - 1)
+        close = m.end() - 1 + len(args)
+        if m.end() - 1 < at < close:
+            return True
+        tail = re.match(r"\s*(?:\bor\b|\?\?|\|\|)\s*(?:\w+\(\s*)*", code[close:])
+        if tail and close + tail.end() == at:
+            return True
+    for m in READ_ENV.finditer(code):
+        if m.end() <= at <= m.end() + len(bound(code[m.end():])):
+            return True
+    return any(m.end() == at for m in READ_EXPANSION.finditer(code))
+
+
+def has_read(code):
+    return bool(READ_CALL.search(code) or READ_ENV.search(code) or READ_EXPANSION.search(code))
+
+
+def balanced(code, start):
+    depth = 0
+    for k in range(start, len(code)):
+        depth += code[k] == "("
+        depth -= code[k] == ")"
+        if depth == 0:
+            return code[start:k + 1]
+    return code[start:]
+
+
+def top_level(args):
+    ""
+    out, depth = [], 0
+    for ch in args:
+        if ch in "([{":
+            depth += 1
+            out.append(ch if depth == 1 else " ")
+        elif ch in ")]}":
+            out.append(ch if depth == 1 else " ")
+            depth -= 1
+        else:
+            out.append(ch if depth == 1 else " ")
+    return "".join(out)
+
+
+def bound(rhs):
+    ""
+    depth = 0
+    for k, ch in enumerate(rhs):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return rhs[:k]
+            depth -= 1
+        elif ch in ",;" and depth == 0:
+            return rhs[:k]
+    return rhs
+
+
+def find_literal(code, strs, prev_strs, lang, start=0, path=""):
+    ""
+    def hit(num_match, group, why):
+        num = num_match[group]
+        return None if exempt(num) or num_match.start(group) < start else (num, why, num_match.start(group))
+    pos, m = 0, ASSIGN.search(code)
+    while m:
+        pos = m.end("id")
+        if not is_limit_name(m["id"]) or ui_key(m["id"], path):
+            m = ASSIGN.search(code, pos)
+            continue
+        rhs, off, why = bound(m["rhs"]), m.start("rhs"), f"`{m['id']}` is a limit name"
+        for rx in (LEADING, FALLBACK):
+            x = rx.search(rhs)
+            if x and (rx is LEADING or has_read(code)) and x.start("num") + off >= start and not exempt(x["num"]):
+                return x["num"], why, x.start("num") + off
+        if has_read(code):
+            for x in re.finditer(NUM, rhs):
+                if x.start() + off >= start and not exempt(x[0]):
+                    return x[0], why, x.start() + off
+        m = ASSIGN.search(code, pos)
+    for m in CALLED.finditer(code):
+        if m["id"] not in ("max", "min") and is_limit_name(m["id"]) and (r := hit(m, "num", f"`{m['id']}(…)` sets a limit")):
+            return r
+    for m in COMPARED.finditer(code):
+        ident, g = (m["id"], "num") if m["id"] else (m["id2"], "num2")
+        if is_limit_name(ident) and (r := hit(m, g, f"`{ident}` is compared with a fixed limit")):
+            return r
+    for m in DURATION.finditer(code):
+        for x in re.finditer(NUM, balanced(code, m.end() - 1)):
+            at = m.end() - 1 + x.start()
+            if not exempt(x[0]) and at >= start:
+                return x[0], f"`{m[0].strip('( ')}` takes a duration or a page size", at
+    for m in MAX_METHOD.finditer(code):
+        args = top_level(balanced(code, m.end() - 1))
+        for x in re.finditer(NUM, args):
+            at = m.end() - 1 + x.start()
+            if "," not in args and not exempt(x[0]) and at >= start:
+                return x[0], "`.max(N)` caps a value at a fixed number", at
+    for m in MIN_CALL.finditer(code):
+        args = top_level(balanced(code, m.end() - 1))
+        for x in re.finditer(NUM, args):
+            at = m.end() - 1 + x.start()
+            if not exempt(x[0]) and at >= start:
+                return x[0], "`min(x, N)` caps a value at a fixed number", at
+    if lang == "c" and start == 0:
+        m = CLOSES_CALL.match(code)
+        if m and not exempt(m["num"]):
+            return m["num"], "closes a call with a number (a delay or a cap)", m.start("num")
+    if lang == "sh":
+        m = SHELL_WAIT.search(code, start)
+        g = "num" if m and m["num"] else "num2"
+        if m and (not exempt(m[g]) or m[g][-1] in "mhd"):
+            return m[g], "a shell wait or timeout", m.start(g)
+    m = DEFAULT_ARG.search(code, start)
+    if m and not exempt(m["num"]) and any(is_limit_name(w) for w in re.findall(r"[\w$]+", strs + " " + prev_strs)):
+        return m["num"], "the default of an option whose name is a limit", m.start("num")
+    return None
+
+
+def joined(codes, ln):
+    ""
+    text, k = codes[ln - 1], ln - 2
+    while k >= 0 and ln - 2 - k < 4 and codes[k].rstrip()[-1:] in tuple("([{,=\\+-*/|&?:"):
+        text = codes[k] + " " + text
+        k -= 1
+    return text, len(text) - len(codes[ln - 1])
+
+
+def judge(comment, code, found, comment_prev, code_prev):
+    ""
+    literal, why, at = found
+    for text, is_prev in ((comment, False), (comment_prev, True)):
+        m = ALLOW.search(text)
+        if m and (not is_prev or not code_prev.strip()):
+            reason = re.sub(r"[*/\-<>!\s]+$", "", m["reason"]).strip()
+            if re.search(r"\w{2,}", reason):
+                return "allowed", f"{literal}: {reason}"
+            return "refused", (f"{literal}: `lint: allow N1` has no reason; write why this number is this number "
+                               f"(`lint: allow N1 <reason>`)")
+    if fallback_of_a_read(code, at):
+        if (DECISION.search(comment) or (not code_prev.strip() and DECISION.search(comment_prev))):
+            return "allowed", f"{literal}: read from a setting, the fallback names its decision"
+        return "refused", (f"{literal} is the fallback of a setting, but its comment does not name the decision; add "
+                           f"`decision NN` (the DECISIONS row that chose it) in a comment beside it, or write "
+                           f"`lint: allow N1 <reason>`")
+    return "refused", (f"{literal}: {why}. Read it from a setting and keep this number as the fallback, naming its "
+                       f"decision (`decision NN`); or write `lint: allow N1 <reason>` on this line; or put it in a test")
+
+
+def language(path, blob):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in EXT:
+        return EXT[ext]
+    if not ext and blob.startswith("#!"):
+        first = blob.split("\n", 1)[0]
+        return "py" if "python" in first else "sh" if re.search(r"\b(ba|z|da)?sh\b", first) else "c" if "node" in first else None
+    return None
+
+
+def added_lines(repo, base, head):
+    mb = git(repo, "merge-base", base, head).strip()
+    out = git(repo, "-c", "core.quotepath=off", "diff", "-U0", "--no-color", "--no-ext-diff", "-a", "-M", mb, head)
+    files, cur, header = {}, None, False
+    for row in out.splitlines():
+        if row.startswith("diff --git "):
+            cur, header = None, True
+        elif header and row.startswith("+++ "):
+            header = False
+            name = row[4:].split("\t")[0]
+            cur = None if name == "/dev/null" else (name[2:] if name.startswith("b/") else name)
+            if cur is not None:
+                files.setdefault(cur, [])
+        elif row.startswith("@@") and cur is not None:
+            header = False
+            m = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", row)
+            if m:
+                start, count = int(m[1]), int(m[2]) if m[2] is not None else 1
+                files[cur].extend(range(start, start + count))
+    return files
+
+
+def run(repo, base, head="HEAD"):
+    ""
+    findings, checked, skipped = [], 0, []
+    for path, lines in sorted(added_lines(repo, base, head).items()):
+        if not lines or TEST_PATH.search(path):
+            continue
+        if path.startswith('"'):
+            skipped.append((path, "a path git quotes"))
+            continue
+        shown = subprocess.run(["git", "-C", repo, "show", f"{head}:{path}"], capture_output=True)
+        if shown.returncode != 0:
+            skipped.append((path, f"git cannot show it: {shown.stderr.decode('utf-8', 'replace').strip()[:120]}"))
+            continue
+        blob = shown.stdout.decode("utf-8", "replace")
+        if not blob:
+            continue
+        lang = language(path, blob)
+        if lang is None:
+            continue
+        if len(blob.encode("utf-8", "replace")) > MAX_FILE_BYTES or "\x00" in blob:
+            skipped.append((path, "a binary file or one over 1 MiB"))
+            continue
+        raws = blob.split("\n")
+        codes, strs, comms = scan(blob, lang)
+        if len(codes) != len(raws):
+            skipped.append((path, f"the scanner counted {len(codes)} lines where the file has {len(raws)}"))
+            continue
+        checked += 1
+        for ln in lines:
+            if not 1 <= ln <= len(raws):
+                continue
+            if len(raws[ln - 1]) > MAX_LINE_CHARS:
+                skipped.append((f"{path}:{ln}", "a line over 4000 characters"))
+                continue
+            stmt, start = joined(codes, ln)
+            found = find_literal(stmt, strs[ln - 1], strs[ln - 2] if ln > 1 else "", lang, start, path)
+            if found:
+                verdict, text = judge(comms[ln - 1], stmt, found, comms[ln - 2] if ln > 1 else "",
+                                      codes[ln - 2] if ln > 1 else "")
+                findings.append((verdict, path, ln, text))
+    return findings, checked, skipped
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repo")
+    ap.add_argument("--base", help="base ref (default: origin/<base branch> from project.json, or origin/main)")
+    ap.add_argument("--head", default="HEAD", help="ref to lint (default HEAD)")
+    ap.add_argument("--client")
+    a = ap.parse_args()
+    try:
+        repo = os.path.expanduser(a.repo)
+        base = _ML.resolve_base(repo, a.base, a.client)
+        findings, checked, skipped = run(repo, base, a.head)
+    except Exception as e:
+        print(f"magic-number-lint: not checked: {e.__class__.__name__}: {e}", file=sys.stderr)
+        return 2
+    refused = allowed = 0
+    for verdict, path, line, text in findings:
+        if verdict == "allowed":
+            allowed += 1
+            print(f"allowed N1 {path}:{line} — {text}")
+        else:
+            refused += 1
+            print(f"ERROR   N1 {path}:{line} — {text}")
+    for where, why in skipped:
+        print(f"not checked {where} — {why}")
+    if not checked and not skipped:
+        print(f"magic-number-lint: no code file added or changed against {base}: nothing to check")
+        return 0
+    print(f"magic-number-lint: {checked} code file(s) against {base}: {refused} refused, {allowed} allowed, "
+          f"{len(skipped)} not checked")
+    return 1 if refused else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

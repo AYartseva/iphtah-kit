@@ -34,28 +34,126 @@ def slots_for(kind):
     return int(env) if env else int(_machine.limit(f"{kind}_slots"))
 
 
+def queue_dir():
+    ""
+    return os.path.expanduser(os.environ.get("IPHTAH_QUEUE_DIR", "~/.local/state/iphtah-kit/run-queued"))
+
+
+def waiter_places(kind, qdir):
+    ""
+    prefix = f"{kind}.waiter."
+    places = []
+    try:
+        names = os.listdir(qdir)
+    except OSError:
+        return places
+    for name in names:
+        rest = name[len(prefix):] if name.startswith(prefix) else ""
+        if rest.isdigit():
+            places.append((int(rest), os.path.join(qdir, name)))
+    places.sort()
+    return places
+
+
+def ticket_held(path):
+    ""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+def waiting_places(kind, qdir, seq):
+    ""
+    ahead = total = 0
+    for other, path in waiter_places(kind, qdir):
+        if other == seq or ticket_held(path):
+            total += 1
+            if other < seq:
+                ahead += 1
+    return ahead, total
+
+
+def our_turn(ahead):
+    ""
+    return ahead == 0
+
+
+def waiting_line(kind, position, total):
+    ""
+    return f"run-queued: waiting for a {kind} slot (position {position} of {total})…"
+
+
+def join_line(kind, qdir):
+    ""
+    seq = 1 + max((n for n, _ in waiter_places(kind, qdir)), default=0)
+    path = os.path.join(qdir, f"{kind}.waiter.{seq}")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return seq, path, fd
+
+
+def leave_line(fd, path):
+    ""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    os.close(fd)
+
+
 def acquire(kind):
     ""
     slots = slots_for(kind)
-    qdir = os.path.expanduser(os.environ.get("IPHTAH_QUEUE_DIR", "~/.local/state/iphtah-kit/run-queued"))
+    qdir = queue_dir()
     os.makedirs(qdir, exist_ok=True)
-    fds = [os.open(os.path.join(qdir, f"{kind}.{n}.lock"), os.O_RDWR | os.O_CREAT, 0o644)
-           for n in range(slots)]
-    held, told, start = None, False, time.time()
-    while held is None:
-        for fd in fds:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held = fd
+    line_fd = os.open(os.path.join(qdir, f"{kind}.line"), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(line_fd, fcntl.LOCK_EX)
+    ticket_fd = None
+    try:
+        seq, ticket, ticket_fd = join_line(kind, qdir)
+        fds = [os.open(os.path.join(qdir, f"{kind}.{n}.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+               for n in range(slots)]
+        held, told, start = None, False, time.time()
+        while held is None:
+            ahead, total = waiting_places(kind, qdir, seq)
+            if our_turn(ahead):
+                for slot_fd in fds:
+                    try:
+                        fcntl.flock(slot_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        held = slot_fd
+                        break
+                    except BlockingIOError:
+                        continue
+            if held is not None:
                 break
-            except BlockingIOError:
-                continue
-        if held is None:
+            message = None
             if not told:
-                print(f"run-queued: waiting for a {kind} slot ({slots} on this machine)…",
-                      file=sys.stderr, flush=True)
+                message = waiting_line(kind, ahead + 1, max(total, ahead + 1))
                 told = True
+            fcntl.flock(line_fd, fcntl.LOCK_UN)
+            if message:
+                print(message, file=sys.stderr, flush=True)
             time.sleep(1)
+            fcntl.flock(line_fd, fcntl.LOCK_EX)
+    finally:
+        if ticket_fd is not None:
+            leave_line(ticket_fd, ticket)
+        fcntl.flock(line_fd, fcntl.LOCK_UN)
+        os.close(line_fd)
     if told:
         waited = int(time.time() - start)
         print(f"run-queued: {kind} slot taken after {waited}s", file=sys.stderr, flush=True)
@@ -77,7 +175,7 @@ def held(kind):
     if k != kind or not fd.isdigit():
         return None
     fd = int(fd)
-    qdir = os.path.expanduser(os.environ.get("IPHTAH_QUEUE_DIR", "~/.local/state/iphtah-kit/run-queued"))
+    qdir = queue_dir()
     try:
         st = os.fstat(fd)
         names = [n for n in os.listdir(qdir) if n.startswith(f"{kind}.") and n.endswith(".lock")]

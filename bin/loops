@@ -28,8 +28,9 @@ PARIS = home_zone()[1]
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 CLIENTS = os.path.expanduser(os.environ.get("IPHTAH_CLIENTS", "~/.claude/iphtah-kit/clients"))
-ACTS = ("vela", "owner")
-ACTS_HELP = "--acts vela | owner | other:<slug> (who does the action; « who » is for whom; slug = a-z, 0-9, -)"
+AGENT_ACTS = ("vela", "agent")
+ACTS = (*AGENT_ACTS, "owner")
+ACTS_HELP = "--acts vela | agent | owner | other:<slug> (who does the action; « who » is for whom; slug = a-z, 0-9, -)"
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 LINE = re.compile(r"^- \[(?P<mark>[ x])\]\s*(?P<when>\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)?\s*(?:·\s*)?"
@@ -102,6 +103,11 @@ def check_acts(acts):
         return acts
     hint = f"; write other:{slug(name)}" if name and slug(name) else ""
     raise SystemExit(f"loops: « {acts} » is not a who-acts value; {ACTS_HELP}{hint}")
+
+
+def agent_acts(acts):
+    ""
+    return acts in AGENT_ACTS
 
 
 def parse(line):
@@ -207,7 +213,7 @@ def due(lines, now, seen):
     out = []
     for l in lines:
         p = parse(l)
-        if not p or p["mark"] != " " or p["acts"] != "vela" or not p["when"]:
+        if not p or p["mark"] != " " or not agent_acts(p["acts"]) or not p["when"]:
             continue
         when = p["when"] if len(p["when"]) > 10 else p["when"] + " 00:00"
         if when > now:
@@ -279,7 +285,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     ls = sub.add_parser("list"); ls.add_argument("--grep", default=""); ls.add_argument("--all", action="store_true")
     ad = sub.add_parser("add"); ad.add_argument("when"); ad.add_argument("who"); ad.add_argument("what")
-    ad.add_argument("--acts", help="vela | owner | other:<slug>: who does the action (required)")
+    ad.add_argument("--acts", help="vela | agent | owner | other:<slug>: who does the action (required)")
     ap_ = sub.add_parser("append"); ap_.add_argument("key"); ap_.add_argument("text")
     cl = sub.add_parser("close"); cl.add_argument("key"); cl.add_argument("note", nargs="?", default="")
     cl.add_argument("--dropped", metavar="REASON", help="closed without doing it, and why")

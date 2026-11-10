@@ -1,5 +1,8 @@
 # Contributing
 
+Questions and bug reports go to https://github.com/AYartseva/iphtah-support: this repository's own Issues are off.
+Changes go here, as pull requests.
+
 A change you want to propose, a habit, a tool, a wording, a fix, goes as a pull request, from you or your Claude:
 fork the repository, push a branch to your fork, and open the PR with the change and its why. Two or three
 sentences of why is enough; the diff says the rest. When your Claude writes the PR or a comment, it signs with

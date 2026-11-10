@@ -37,12 +37,19 @@ case $build_words in
     exit 1 ;;
 esac
 
+light_box=
 if [ -n "$LIGHT_KIND" ] && ! "$here/run-queued" --held "$LIGHT_KIND"; then
-  if [ -n "${IPHTAH_MC_REQUEUED:-}" ]; then
-    echo "merge-check: re-entered without a $LIGHT_KIND slot held — stopping instead of looping" >&2; exit 2
+  if [ -n "$burst" ] && [ -n "$BURST" ]; then
+    light_box=1
+  else
+    if [ -n "${IPHTAH_MC_REQUEUED:-}" ]; then
+      echo "merge-check: re-entered without a $LIGHT_KIND slot held — stopping instead of looping" >&2; exit 2
+    fi
+    [ -z "$box_asked" ] || [ -n "$BURST" ] || echo "merge-check: --box asked, but $repo has no remote build" \
+      "(no « burst » in its client's project.json): building here, in a $LIGHT_KIND slot" >&2
+    echo "light repository: building in a $LIGHT_KIND slot of run-queued, not behind the load" >&2
+    IPHTAH_MC_REQUEUED=1 exec "$here/run-queued" "$LIGHT_KIND" -- "$here/merge-check" "${args[@]}"
   fi
-  echo "light repository: building in a $LIGHT_KIND slot of run-queued, not behind the load" >&2
-  IPHTAH_MC_REQUEUED=1 exec "$here/run-queued" "$LIGHT_KIND" -- "$here/merge-check" "${args[@]}"
 fi
 unset IPHTAH_MC_REQUEUED
 
@@ -144,16 +151,42 @@ fi
 checks=$WT/logs/$name.$(date +%Y%m%d-%H%M%S).checks
 lint_rc=0
 nolock "$here/migration-lint" "$wt" --base "origin/$base" --branch "$branch" >"$checks" 2>&1 || lint_rc=$?
+mn_rc=0
+mnout=$checks.mn
+nolock "$here/magic-number-lint" "$wt" --base "origin/$base" >"$mnout" 2>&1 || mn_rc=$?
+cat "$mnout" >>"$checks"
 nolock "$here/save-check" "$wt" --base "origin/$base" >>"$checks" 2>&1 || echo "save-check failed (exit $?)" >>"$checks"
 nolock timeout 120 "$here/two-sources-lint" "$wt" --base "origin/$base" --client "$CLIENT" >>"$checks" 2>&1 \
   || { rc=$?; if [ "$rc" -eq 124 ]; then echo "two-sources-lint timed out (120 s)"; else echo "two-sources-lint failed (exit $rc)"; fi >>"$checks"; }
 cat "$checks" >>"$log"
-findings=$(grep -E '^(ERROR|warn|allowed) |^(save-check|two-sources-lint) (failed|timed out)' "$checks" || true)
+findings=$(grep -E '^(ERROR|warn|allowed|not checked) |^(save-check|two-sources-lint) (failed|timed out)' "$checks" || true)
 [ "$lint_rc" -ge 2 ] && findings="${findings:+$findings$'\n'}migration-lint failed (exit $lint_rc): $(tail -1 "$checks")"
-rm -f "$checks"
-show_findings() { [ -z "$findings" ] || printf '%s\n' "$findings" | sed 's/^/  /'; }
+notchecked=
+if [ "$mn_rc" -ge 2 ]; then
+  mn_why=$(grep -v '^$' "$mnout" | tail -1 || true)
+  notchecked="NOT CHECKED — magic-number-lint (exit $mn_rc): ${mn_why:-no output}"
+fi
+rm -f "$checks" "$mnout"
+mn_error=
+case ${MAGIC_NUMBERS:-warning} in
+  error) mn_error=1 ;;
+  warning) ;;
+  *) notchecked="${notchecked:+$notchecked$'\n'}magic_numbers: unknown value « $MAGIC_NUMBERS » in the client's project.json, read as \"warning\" (the values are \"warning\" and \"error\")" ;;
+esac
+mn_note=
+if [ "$mn_rc" -eq 1 ] && [ -z "$mn_error" ]; then
+  findings=$(printf '%s\n' "$findings" | sed 's/^ERROR   N1 /warn    N1 /')
+  mn_note="magic-number-lint WARNING (the verdict is unchanged): a limit chosen in the code. To pass honestly, read it from a setting (a settings file or the environment, the code holding only a fallback, and a comment naming the decision) or write \`lint: allow N1 <reason>\` on its line. It becomes an error only for a client whose project.json says \"magic_numbers\": \"error\"."
+fi
+show_findings() { [ -z "$notchecked" ] || echo "$notchecked"; [ -z "$mn_note" ] || echo "$mn_note"; [ -z "$findings" ] || printf '%s\n' "$findings" | sed 's/^/  /'; }
 if [ "$lint_rc" -eq 1 ]; then
   echo "RED — migration-lint: an error in the branch's migrations (worktree kept at $wt, log: $log)"
+  show_findings
+  record RED
+  exit 1
+fi
+if [ "$mn_rc" -eq 1 ] && [ -n "$mn_error" ]; then
+  echo "RED — magic-number-lint: a limit chosen in the code, with no setting and no written reason (project.json \"magic_numbers\": \"error\"; worktree kept at $wt, log: $log)"
   show_findings
   record RED
   exit 1

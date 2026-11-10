@@ -30,6 +30,17 @@
         ]
       },
       {
+        "matcher": "Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/iphtah-kit/bin/push-gate",
+            "timeout": 20,
+            "statusMessage": "push-gate: checking the pushed commit against its definition of done (done.json)"
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -52,6 +63,17 @@
             "command": "~/.claude/iphtah-kit/bin/heavy-gate",
             "timeout": 10,
             "statusMessage": "heavy-gate: kill by PID"
+          }
+        ]
+      },
+      {
+        "matcher": "Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/iphtah-kit/bin/heavy-gate",
+            "timeout": 10,
+            "statusMessage": "heavy-gate: full suites run on the build box"
           }
         ]
       }

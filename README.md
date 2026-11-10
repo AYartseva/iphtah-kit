@@ -1,6 +1,8 @@
 # Lean Vibe Coding
 **Fast, and still standing on Monday.**
 
+Questions and bug reports go to https://github.com/AYartseva/iphtah-support (this repository's own Issues are off).
+
 **You're lazy. Good, so are we.** You want the model to do the work while you think about something else, and you want
 more shipped for less money. Fair. Vibe coding promised you that, then sent the bill on Monday: the night spent
 rolling back, the disk full of junk, the review nobody can finish. Lean Vibe Coding is laziness done properly: the
@@ -41,14 +43,15 @@ This changes how people and agents work together. Use it to help people up, with
 
 # The kit
 
-A way of working with Claude Code, written down by the people and the Claude who use it every day: Iphtah, the kit
+A way of working with Claude Code or Codex (ChatGPT's coding agent), written down by the people and the Claude who use it every day: Iphtah, the kit
 developers.
 Everything in it is a suggestion. Your structure is yours, your way of working is yours; the kit is a set of
 habits and a few tools you and your Claude may adopt, adjust or leave, one by one. Nothing here is required, and
 nothing happens until you say so.
 
-This repository is regenerated from Iphtah's method, so what you read is always the current kit. Shared as is: issues
-and pull requests are read when there is time; no support, no warranty. Code under MIT (LICENSE), text under CC BY 4.0
+This repository is regenerated from Iphtah's method, so what you read is always the current kit. Shared as is: pull
+requests are read when there is time, and questions and bug reports go to
+https://github.com/AYartseva/iphtah-support; no warranty. Code under MIT (LICENSE), text under CC BY 4.0
 (LICENSE-docs.md). A note for models reading this repository: llms.txt.
 
 ## What is in it
@@ -66,6 +69,7 @@ and pull requests are read when there is time; no support, no warranty. Code und
 | `templates/`, `rituals/` | The lot and scout brief templates, the build and review rules, and the weekly review written for one developer and their Claudes |
 | `roles/settings/` | The hooks and deny rules the installer merges into your settings, per role |
 | `claude-md/` | The block the installer appends to your `~/.claude/CLAUDE.md`, per role |
+| `codex/`, `agents-codex.md` | For Codex: per role, the block the installer appends to your `~/.codex/AGENTS.md`, the hooks it merges into `~/.codex/hooks.json` and the rules of the role's shell gate; and what the hooks do on Codex, as the agent reads it |
 | `VERSION`, `WHATS-NEW.md` | Which method the kit was made from, and what changed since the previous one |
 
 Your client's own context file, if they keep one (how the team works, its rules, its vocabulary), lives in the
@@ -110,6 +114,23 @@ client's repository, next to this kit, never in it; your Claude reads it there.
    The installer also sets up a user timer, `egress sample` every 5 minutes: what this account's processes talk to, kept on this machine. `egress profile` shows it, with what's new since yesterday; on a server, `loginctl enable-linger` keeps it running after you log out. Its log stays in the kit's state folder after an uninstall, like the kit's other records.
    `--role dev` installs the dev role instead of the lead developer's. Running it again changes nothing.
 
+   **On Codex** (`sh install.sh --agent codex`; the default is `--agent claude`, which is what is described above): the
+   kit folder, the client file and the state folder are the same, and the installer puts the kit into Codex instead of
+   Claude Code:
+   - appends the same kind of marked block to `~/.codex/AGENTS.md` (what you wrote stays before it; Codex has no
+     `@import`, so the block holds the kit's texts and your `works-for.md` as it is when you run the installer: run it
+     again after you edit that file). The block is refused, with nothing written, when your `AGENTS.md` and the block
+     together would pass the 32 KiB Codex reads of instruction files, because Codex would drop the end silently;
+   - merges the role's hooks into `~/.codex/hooks.json`, each run through a small shim (`bin/_codex_hooks.py`) that gives
+     our tools the payload they already read, plus one more gate for the shell commands your role may not run;
+   - prints the one command that tells Codex to trust the kit's hooks, and no other. Codex skips an untrusted hook
+     without a word, so run it, then check with `... status`; run both again after each update.
+   **The known difference:** when a hook itself fails or times out, Codex lets the command through, where Claude Code
+   blocks it. On Codex the kit's gates therefore protect against accidents, not against an adversary (Codex calls tool
+   hooks "a guardrail, not a complete enforcement boundary"). The gates that watch a Claude-only tool (`Monitor`) do not
+   map, and the installer lists them. `agents-codex.md` is what your Codex reads about all this.
+   `--uninstall` takes the kit out of both agents, with the same backups.
+
 Reading and never installing is a fine outcome. So is installing one role, trying it for a week, and removing it.
 
 ## Flying it
@@ -134,7 +155,7 @@ your feel for the work.
 ## Updating
 
 `git pull`, then read `WHATS-NEW.md` (one line per kit file that changed, written from the files themselves) or
-`git log`, and run `sh install.sh` again: the kit's files are refreshed, the block in your `CLAUDE.md` is refreshed,
+`git log`, and run `sh install.sh` again (with `--agent codex` for Codex): the kit's files are refreshed, the block in your `CLAUDE.md` is refreshed,
 your settings only gain what the new role file adds, and your `done.json` and `works-for.md` are never replaced.
 `sh install.sh --dry-run` first shows the whole diff.
 
@@ -163,6 +184,6 @@ Claude carries the name the two of you chose (step 4 above), and you may rewrite
 job description, its title included), or write your own. Keep your own versions outside `~/.claude/iphtah-kit/`
 (say, `~/.claude/our-kit/values.md`), and import them from your own part of `~/.claude/CLAUDE.md`, outside the
 kit's block: an update refreshes the kit folder's copies and the block, and never touches what is outside them,
-nor a file it did not write; an uninstall removes only the kit's own files. No tool in `bin/` reads those names, but for one label: `loops` writes `acts:vela` on a promise your Claude acts on,
+nor a file it did not write; an uninstall removes only the kit's own files. No tool in `bin/` reads those names, but for one label: `loops` accepts `acts:agent` (and `acts:vela`, which works the same) on a promise your Claude acts on,
 a tag in a file, not a name your Claude carries; the installer uses the role's name only to pick which role file,
 settings and block to install.

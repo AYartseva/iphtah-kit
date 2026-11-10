@@ -116,6 +116,7 @@ def main():
             "BASE": r["base"], "BUILD": r["build"], "BURST": expand(r["burst"].split()[0]) + " " + " ".join(r["burst"].split()[1:]) if r.get("burst") else "",
             "LOCK": r.get("lock", ""), "LIGHT_KIND": light_kind(r), "LOCK_SLOTS": str(r.get("lock_slots", 1)), "STATE": expand(cfg["state_dir"]), "WT": expand(cfg["worktrees"]),
             "AUTHOR": cfg.get("author", ""),
+            "MAGIC_NUMBERS": str(cfg.get("magic_numbers", "warning")),
         }
         for k, v in values.items():
             print(f"{k}={shlex.quote(v)}")

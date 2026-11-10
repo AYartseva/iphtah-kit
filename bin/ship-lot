@@ -32,6 +32,24 @@ def repo_of(client, wt):
     sys.exit(f"ship-lot: {url} is not a repository of client {client}")
 
 
+def verify_lot_module():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("verify_lot_for_ship", os.path.join(HERE, "verify-lot")).load_module()
+
+
+def body_with_waiver(body_path, waived):
+    ""
+    with open(body_path, encoding="utf-8") as fh:
+        text = fh.read()
+    if not waived or "mutant-check waived:" in text:
+        return body_path, False
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="ship-lot-body.", suffix=".md")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text.rstrip("\n") + "\n\n" + waived + "\n")
+    return tmp, True
+
+
 def push_gate_module():
     from importlib.machinery import SourceFileLoader
     return SourceFileLoader("push_gate", os.path.join(HERE, "push-gate")).load_module()
@@ -224,6 +242,9 @@ def main():
             if re.search(r"^\s+(tree|strays|containers):", l) and not re.search(r"clean|none", l))
         if not (a.containers_ok and only_containers and re.search(r"green:\s+\S+ " + head, report)):
             sys.exit("ship-lot: verify-lot is not OK:\n" + report)
+    waived = verify_lot_module().mutant_waived(report)
+    if waived:
+        print(f"ship-lot: {waived}")
 
     with open(os.path.expanduser(f"~/.claude/iphtah-kit/clients/{a.client}/project.json")) as fh:
         proj = json.load(fh)
@@ -246,6 +267,8 @@ def main():
 
     plan = [f"push {branch} @ {head[:8]} to {repo['github']}",
             f"open a {'draft ' if a.draft else ''}PR {branch} → {a.base}: {a.title}"]
+    if waived:
+        plan.append(f"the PR body says « {waived} »")
     plan += [f"lots done {a.lot}"]
     if not a.approved:
         auto, why = False, None
@@ -257,8 +280,13 @@ def main():
         print(f"ship-lot: checks OK; pushing without a per-batch go: {why}")
 
     push(branch, wt, head)
-    pr = run(["gh", "pr", "create", "-R", repo["github"], "--base", a.base, "--head", branch,
-              "--title", a.title, "--body-file", a.body] + (["--draft"] if a.draft else []), cwd=wt).splitlines()[-1]
+    body_file, temporary = body_with_waiver(a.body, waived)
+    try:
+        pr = run(["gh", "pr", "create", "-R", repo["github"], "--base", a.base, "--head", branch,
+                  "--title", a.title, "--body-file", body_file] + (["--draft"] if a.draft else []), cwd=wt).splitlines()[-1]
+    finally:
+        if temporary:
+            os.remove(body_file)
     print(f"PR: {pr}")
     lot_done = subprocess.run([f"{HERE}/lots", "--client", a.client, "done", a.lot, "--worktree", wt, "--base", a.base],
                               capture_output=True, text=True)

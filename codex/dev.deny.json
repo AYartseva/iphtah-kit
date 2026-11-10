@@ -1,0 +1,16 @@
+{
+  "role": "dev",
+  "rules": [
+    "Bash(gh pr merge:*)",
+    "Bash(gh api *merge*)",
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)",
+    "Bash(hcloud:*)",
+    "Bash(aws:*)",
+    "Bash(gcloud:*)",
+    "Bash(az:*)",
+    "Bash(doctl:*)",
+    "Bash(gh issue close:*)",
+    "Bash(gh pr review --approve:*)"
+  ]
+}

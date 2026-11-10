@@ -1,0 +1,9 @@
+{
+  "role": "lead-dev",
+  "rules": [
+    "Bash(gh pr merge:*)",
+    "Bash(gh api *merge*)",
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)"
+  ]
+}

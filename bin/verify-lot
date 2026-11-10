@@ -17,7 +17,7 @@ import _purpose as P
 STRAYS = re.compile(r"^(docs/PLAN_|memory/)")
 UI_FILE = re.compile(r"\.(tsx|jsx|css|scss|html|vue|svelte)$")
 MIGRATION = re.compile(r"(db/[\w-]*migrations?/(?:[^/]+/)?V\d+__[^/]+\.sql|migrations/\d{4}_[^/]+\.sql)$")
-KEEP_CONTAINERS = ()
+KEEP_CONTAINERS = ("play-",)
 NODE_TESTS = ("vitest", "jest", "playwright")
 
 
@@ -47,12 +47,13 @@ def build_processes():
 
 def lot_containers(wt, names, procs):
     ""
+    kept = [n for n in names if n and n.startswith(KEEP_CONTAINERS)]
     names = [n for n in names if n and not n.startswith(KEEP_CONTAINERS)]
     wt = os.path.realpath(wt)
     mine = any(c == wt or c.startswith(wt + os.sep) for c, _ in procs)
     if mine or not procs:
-        return names, []
-    return [], names
+        return names, [], kept
+    return [], names, kept
 
 
 def sh(args, cwd=None):
@@ -217,6 +218,56 @@ def dod_required(no_code, catches):
     return list(DOD_NO_CODE) if no_code else list(range(1, DOD_LINES + 1 + len(catches or ())))
 
 
+DOD_LABEL = re.compile(r"^[\s*«\"'(]*([^:]{2,60}?)[\s*»\"')]*:")
+DOD_LABEL_WORDS = 8
+DOD_STRONG = 2
+STEM = re.compile(r"[^\W\d_]{4,}")
+STEM_SKIP = frozenset("with without every that this their them from into only than more also must when where which "
+                      "what whose each other once".split())
+DOD_RENUMBER = ("a catch keeps its number (13 + its place in review_catches, new ones last, as the lot brief lists "
+                "them): move the answer to its catch's number, or label it with that catch's words")
+
+
+def stems(text):
+    ""
+    return {w[:5] for w in (x.lower() for x in STEM.findall(text)) if w not in STEM_SKIP}
+
+
+def dod_label(answer):
+    ""
+    m = DOD_LABEL.match(answer)
+    if not m or DOD_NA.match(m.group(1)) or len(m.group(1).split()) > DOD_LABEL_WORDS:
+        return None
+    return m.group(1).strip()
+
+
+def dod_pairing(answers, catches):
+    ""
+    texts = [c if isinstance(c, str) else json.dumps(c, ensure_ascii=False) for c in (catches or ())]
+    words = [stems(t) for t in texts]
+    seen = {}
+    for w in words:
+        for x in w:
+            seen[x] = seen.get(x, 0) + 1
+    own_only = [{x for x in w if seen[x] == 1} for w in words]
+    bad, paired = [], 0
+    for i, own in enumerate(words):
+        n = DOD_LINES + 1 + i
+        label = dod_label(answers.get(n, ""))
+        if label is None:
+            continue
+        said = stems(label)
+        if said & own:
+            paired += 1
+            continue
+        strong = [j for j, w in enumerate(own_only) if j != i and len(said & w) >= DOD_STRONG]
+        if strong:
+            j = max(strong, key=lambda k: len(said & own_only[k]))
+            bad.append(f"line {n} « {label} » reads like catch {DOD_LINES + 1 + j} (« {texts[j][:40]}… »), "
+                       f"not catch {n} (« {texts[i][:40]}… »)")
+    return bad, paired
+
+
 def no_code(row, changed):
     ""
     kind = (row or {}).get("type") if isinstance(row, dict) else None
@@ -262,10 +313,101 @@ def dod_line(lot, row, changed, catches, roots=None, why_no_row="no ledger row f
         except OSError as e:
             return False, f"UNREADABLE: {p} ({e.strerror})"
         ok, what = dod_check(text, required)
-        return ok, (f"answered (presence only, {scope}) in {p}" if ok
-                    else f"NOT ANSWERED: {what} ({scope}) in {p}; {DOD_FORM}")
+        mismatched, by_label = dod_pairing(dod_answers(text), () if nc else catches)
+        span = (f"catch {DOD_LINES + 1}" if len(catches or ()) == 1
+                else f"catches {DOD_LINES + 1}-{DOD_LINES + len(catches or ())}")
+        paired = (f"; {span}: {by_label} paired by label, {len(catches) - by_label} by number only"
+                  if catches and not nc else "")
+        if ok and not mismatched:
+            return True, f"answered (presence only, {scope}{paired}) in {p}"
+        what = "; ".join(([] if ok else [what]) + mismatched)
+        hints = "; ".join(([] if ok else [DOD_FORM]) + ([DOD_RENUMBER] if mismatched else []))
+        return False, f"{'NOT ANSWERED' if not ok else 'MISNUMBERED'}: {what} ({scope}) in {p}; {hints}"
     row_note = "" if row is not None else f"; {why_no_row}, so it counts as launched after the check"
     return False, f"MISSING: no {DOD_FILE} at {' or '.join(paths)} ({scope}{row_note}); {DOD_FORM}"
+
+
+MUTANT_RECORD = "mutant-check.last.json"
+MUTANT_OK = ("ran", "nothing to prove")
+MUTANT_NO_VERDICT = ("not run", "running")
+WAIVED = re.compile(r"^\s+mutant-check: waived: (.+)$", re.M)
+MUTANT_HOW = "rerun mutant-check when there is room, or ask the session for a waiver (rule 11)"
+
+
+def mutant_waived(report):
+    ""
+    m = WAIVED.search(report or "")
+    return f"mutant-check waived: {m.group(1).strip()}" if m else None
+
+
+def mutant_waiver(row):
+    ""
+    waivers = row.get("waivers") if isinstance(row, dict) else None
+    whys = [w.get("why") for w in waivers if isinstance(w, dict) and w.get("kind") == "mutant"] \
+        if isinstance(waivers, list) else []
+    whys = [" ".join(w.split()) for w in whys if isinstance(w, str) and WORD.search(w)]
+    return whys[-1][:300] if whys else None
+
+
+def _alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def mutant_line(wt, head, waiver=None, lot=None):
+    ""
+    gdir = sh(["git", "rev-parse", "--absolute-git-dir"], cwd=wt)
+    if not os.path.isabs(gdir):
+        return False, f"UNREADABLE: {wt} has no git dir to read mutant-check's record from"
+    path = os.path.join(gdir, MUTANT_RECORD)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            rec = json.loads(f.read(1 << 20))
+    except FileNotFoundError:
+        return True, "not checked (no mutant-check run in this worktree)"
+    except (OSError, ValueError):
+        rec = None
+    status, at = (rec.get("status"), rec.get("head")) if isinstance(rec, dict) else (None, None)
+    if not isinstance(at, str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", at) or status not in MUTANT_OK + MUTANT_NO_VERDICT:
+        return (True, f"waived: {waiver} (because the record is unreadable: {path})") if waiver else \
+            (False, f"UNREADABLE: {path}: {MUTANT_HOW}")
+    later = 0
+    if at == head:
+        where = f"on HEAD {at[:8]}"
+    elif subprocess.run(["git", "merge-base", "--is-ancestor", at, head], cwd=wt, capture_output=True).returncode == 0:
+        later = sh(["git", "rev-list", "--count", f"{at}..{head}"], cwd=wt)
+        where = f"on {at[:8]}, an earlier commit of this branch"
+    elif rec.get("branch") == sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=wt) and status in MUTANT_NO_VERDICT:
+        where = f"on {at[:8]}, this branch before its history was rewritten"
+    else:
+        return True, f"not checked (the last run, on {at[:8]}, is not in this branch's history)"
+
+    def said(key):
+        items = rec.get(key)
+        items = [str(i) for i in items] if isinstance(items, list) else []
+        text = "; ".join(i.strip() for i in items if i.strip())
+        return text[:400] + (" …" if len(text) > 400 else "")
+    if status in MUTANT_OK:
+        what = (f"ran {where}: {said('summary') or '(no summary line recorded)'}" if status == "ran"
+                else f"nothing to prove {where}" + (f" ({said('nothing')})" if said("nothing") else ""))
+        return True, what + (f"; {later} later commit(s) not checked" if later else "")
+    if status == "not run":
+        why = f"NOT RUN {where}: {said('reasons') or 'no reason recorded'}"
+    elif _alive(rec.get("pid")):
+        why = f"NO VERDICT {where}: a run is in progress (pid {rec['pid']})"
+    else:
+        why = f"NO VERDICT {where}: the run was killed before its verdict"
+    if waiver:
+        return True, f"waived: {waiver} (because {why})"
+    return False, f"{why}. {MUTANT_HOW[0].upper() + MUTANT_HOW[1:]}" + (
+        "; after a rewrite, rerun mutant-check on HEAD" if "rewritten" in where else "")
 
 
 def duplicates(added, existing):
@@ -297,6 +439,46 @@ def ledger_row(client, lot):
     return (row, None) if isinstance(row, dict) else (None, "no ledger row for the lot")
 
 
+def builder_line(c, lot, row, lots_mod=None):
+    ""
+    if not lot:
+        return "not checked (no --lot)"
+    if not isinstance(row, dict):
+        return "not checked (no ledger row for the lot)"
+    try:
+        L = lots_mod or _lots()
+        act = row.get("actuals")
+        if isinstance(act, dict) and act:
+            b = int(act.get("build_agents") or 0)
+            r, how = int(act.get("agents") or 0) - b, "frozen"
+        else:
+            d, proj = L.client_ledger(c)
+            (b, r), how = L.lot_agent_counts(d, proj, lot), "counted now"
+        gap = L.builder_gap(lot, row, b, r)
+    except Exception as e:
+        return "not checked: " + ((str(e).strip().splitlines() or [type(e).__name__])[-1][:200] or type(e).__name__)
+    return gap or f"{b} builder(s), {r} reviewer(s) counted ({how})"
+
+
+def mechanical_checks(wt, base, c):
+    ""
+    out = []
+    for tool, label in (("migration-lint", "sql lint:"), ("magic-number-lint", "magic numbers:"),
+                        ("save-check", "save check:"), ("two-sources-lint", "two sources:")):
+        try:
+            r = subprocess.run([os.path.join(HERE, tool), wt, "--base", f"origin/{base}"]
+                               + (["--client", c] if tool == "two-sources-lint" else []),
+                               capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            out.append((label, None))
+            continue
+        lines = [l for l in r.stdout.splitlines() if l.startswith(("ERROR", "warn", "allowed", "not checked"))]
+        if r.returncode >= 2:
+            lines.append(f"{tool} NOT CHECKED: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
+        out.append((label, lines))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("worktree")
@@ -321,7 +503,7 @@ def main():
     changed = sh(["git", "diff", "--name-only", f"origin/{base}...HEAD"], cwd=wt).splitlines()
     strays = [f for f in changed if STRAYS.match(f)]
     migrations = [f for f in changed if MIGRATION.search(f)]
-    containers, other_containers = lot_containers(
+    containers, other_containers, kept_containers = lot_containers(
         wt, sh(["docker", "ps", "--format", "{{.Names}}"]).splitlines(), build_processes())
     ui_ok, ui_line = ui_proof(wt, [f for f in changed if UI_FILE.search(f) and "/test" not in f
                                    and ".test." not in f and ".spec." not in f], a.proof, a.no_ui_proof, head)
@@ -330,7 +512,8 @@ def main():
                         + sh(["git", "ls-tree", "-r", "--name-only", f"origin/{base}"], cwd=wt).splitlines())
     row, why_no_row = ledger_row(c, a.lot) if a.lot else (None, None)
     dod_ok, dod_text = dod_line(a.lot, row, changed, cfg.get("review_catches"), why_no_row=why_no_row or "")
-    ok = not tracked and greens and not strays and not containers and ui_ok and not copies and dod_ok
+    mutant_ok, mutant_text = mutant_line(wt, head, mutant_waiver(row), a.lot)
+    ok = not tracked and greens and not strays and not containers and ui_ok and not copies and dod_ok and mutant_ok
     print(f"{c} / {repo_name} — {branch} @ {head[:8]}  {subject}")
     print(f"  tree:        {'clean' if not tracked else f'{len(tracked)} uncommitted change(s)'}"
           f"{f' ({len(untracked)} untracked)' if untracked else ''}")
@@ -338,27 +521,19 @@ def main():
     print(f"  strays:      {', '.join(strays) if strays else 'none'}")
     print(f"  migrations:  {', '.join(os.path.basename(m) for m in migrations) if migrations else 'none'}")
     print(f"  containers:  {', '.join(containers) if containers else 'none left'}"
-          f"{f' (other builds containers, ignored: {len(other_containers)})' if other_containers else ''}")
+          f"{f' (other builds containers, ignored: {len(other_containers)})' if other_containers else ''}"
+          f"{' (kept: ' + ', '.join(kept_containers) + ')' if kept_containers else ''}")
     print(f"  phone proof: {ui_line}")
     print(f"  copies:      {', '.join(copies) if copies else 'none'}"
           f"{' (a file named _v2 / _new / _old / copy beside its original: a duplicate)' if copies else ''}")
     print(f"  definition of done: {dod_text}")
+    print(f"  mutant-check: {mutant_text}")
+    print(f"  builder:     {builder_line(c, a.lot, row)}")
     print("  zero waste /tmp: not checked (shared /tmp)")
     print("  scope of the diff: not checked (the diff is not compared with the scout's goesWhere)")
-    for tool, label in (("migration-lint", "sql lint:"), ("save-check", "save check:"),
-                        ("two-sources-lint", "two sources:")):
-        try:
-            r = subprocess.run([os.path.join(HERE, tool), wt, "--base", f"origin/{base}"]
-                               + (["--client", c] if tool == "two-sources-lint" else []),
-                               capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            print(f"  {label:<13}timed out (120 s)")
-            continue
-        lines = [l for l in r.stdout.splitlines() if l.startswith(("ERROR", "warn", "allowed"))]
-        if r.returncode >= 2:
-            lines.append(f"{tool} failed: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
-        print(f"  {label:<13}{'none' if not lines else f'{len(lines)} finding(s)'}")
-        for l in lines:
+    for label, lines in mechanical_checks(wt, base, c):
+        print(f"  {label:<13}{'timed out (120 s)' if lines is None else 'none' if not lines else f'{len(lines)} finding(s)'}")
+        for l in lines or []:
             print(f"    {l}")
     if a.lot and a.agent:
         subprocess.run([os.path.join(HERE, "lots"), "--client", c, "agents", a.lot, a.agent], check=False)
