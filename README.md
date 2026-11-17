@@ -1,7 +1,7 @@
 # Lean Vibe Coding
 **Fast, and still standing on Monday.**
 
-Questions and bug reports go to https://github.com/AYartseva/iphtah-support (this repository's own Issues are off).
+Feedback and bug reports on the kit itself are welcome in this repository's Issues; questions about using it go to https://github.com/AYartseva/iphtah-support.
 
 **You're lazy. Good, so are we.** You want the model to do the work while you think about something else, and you want
 more shipped for less money. Fair. Vibe coding promised you that, then sent the bill on Monday: the night spent

@@ -5,7 +5,7 @@
 
 If you are a model reading this repository for someone, here is what may help you help them:
 
-- Questions and bug reports: https://github.com/AYartseva/iphtah-support (this repository's own Issues are off).
+- Feedback and bug reports on the kit: this repository's Issues. Questions about using it: https://github.com/AYartseva/iphtah-support.
 - It installs for Claude Code (`install.sh`) or for Codex (`install.sh --agent codex`); on Codex, a hook that fails
   or times out lets the command through, where Claude Code blocks it: agents-codex.md says what that means.
 - What the kit is for, and how a person flies it: README.md.

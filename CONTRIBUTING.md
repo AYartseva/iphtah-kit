@@ -1,6 +1,6 @@
 # Contributing
 
-Questions and bug reports go to https://github.com/AYartseva/iphtah-support: this repository's own Issues are off.
+Feedback and bug reports on the kit itself are welcome in this repository's Issues; questions about using it go to https://github.com/AYartseva/iphtah-support.
 Changes go here, as pull requests.
 
 A change you want to propose, a habit, a tool, a wording, a fix, goes as a pull request, from you or your Claude:
